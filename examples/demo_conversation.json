@@ -1,0 +1,28 @@
+{
+  "turns": [
+    {
+      "session_id": "session-1",
+      "speaker": "Caroline",
+      "text": "I have been thinking about studying psychology because I want to work in mental health.",
+      "timestamp": "2025-01-10T10:00:00"
+    },
+    {
+      "session_id": "session-1",
+      "speaker": "Daniel",
+      "text": "That fits you. You also said you enjoy helping friends work through stressful situations.",
+      "timestamp": "2025-01-10T10:01:00"
+    },
+    {
+      "session_id": "session-2",
+      "speaker": "Caroline",
+      "text": "I am also looking into counseling certification programs in case I want a more applied path.",
+      "timestamp": "2025-02-03T18:20:00"
+    },
+    {
+      "session_id": "session-2",
+      "speaker": "Caroline",
+      "text": "For stress relief I usually go dancing or read for an hour before bed.",
+      "timestamp": "2025-02-03T18:23:00"
+    }
+  ]
+}

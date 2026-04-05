@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+title: "LEAF: Layered Evolutionary Abstraction with Fidelity-preserved Memory"
+message: "If you use LEAF in research, please cite this software record."
+type: software
+authors:
+  - name: "LEAF Authors"
+version: "0.1.0"
+date-released: 2026-04-05
+license: "MIT"
+abstract: >
+  LEAF is a long-horizon conversational memory system built around layered,
+  evolving abstractions while preserving source-level fidelity in leaf nodes.
+  It supports incremental ingestion, state reconciliation, hierarchical
+  retrieval, and evidence recovery from raw conversation spans.

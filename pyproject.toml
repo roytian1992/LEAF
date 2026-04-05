@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "leaf-memory"
+version = "0.1.0"
+description = "LEAF: Layered Evolutionary Abstraction with Fidelity-preserved Memory"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+keywords = ["memory", "agent-memory", "retrieval", "long-context", "hierarchical-memory"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "pyyaml>=6.0",
+  "json-repair>=0.30.0",
+]
+
+[project.scripts]
+leaf = "leaf.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

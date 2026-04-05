@@ -1,0 +1,17 @@
+llm:
+  provider: openai
+  model_name: your-answer-model
+  api_key: your-api-key
+  base_url: http://your-answer-endpoint/v1
+
+embedding:
+  provider: openai
+  model_name: your-embedding-model
+  api_key: your-api-key
+  base_url: http://your-embedding-endpoint/v1
+
+additional_llm:
+  provider: openai
+  model_name: your-memory-model
+  api_key: your-memory-model-key
+  base_url: http://your-memory-model-endpoint/v1
