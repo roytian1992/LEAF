@@ -182,6 +182,10 @@ This structure is meant to support both:
 
 For LoCoMo-specific setup details, evaluation assumptions, and open-domain alignment notes, see [docs/locomo_reproduction.md](docs/locomo_reproduction.md).
 
+For the current canonical experiment reporting protocol, including the latest
+metric set and the `LLM-as-judge x 5` convention, see
+[docs/latest_experiment_protocol.md](docs/latest_experiment_protocol.md).
+
 ## Development
 
 Run the smoke test suite with:
