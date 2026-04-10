@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from typing import Any
 
@@ -30,6 +33,9 @@ from .schemas import RawSpan
 
 SINGLETON_SLOTS = {"location", "employer", "occupation", "relationship_status", "home_city"}
 AMBIGUOUS_ACTIONS = {"PATCH", "SUPERSEDE", "TENTATIVE"}
+INGEST_MODE_ONLINE = "online"
+INGEST_MODE_MIGRATION = "migration"
+INGEST_MODES = {INGEST_MODE_ONLINE, INGEST_MODE_MIGRATION}
 
 
 def _normalize_value(text: str) -> str:
@@ -68,14 +74,21 @@ class LEAFIndexer:
         corpus_id: str,
         title: str,
         turns: list[dict[str, Any]],
+        ingest_mode: str = INGEST_MODE_ONLINE,
     ) -> dict[str, Any]:
+        ingest_mode = self._normalize_ingest_mode(ingest_mode)
+        started_at = time.perf_counter()
         per_session_index: dict[str, int] = {}
         touched_sessions: set[str] = set()
         touched_subjects: set[str] = set()
         events_written = 0
         atoms_written = 0
         objects_written = 0
+        state_candidates = 0
+        evidence_links_written = 0
+        state_action_counts: dict[str, int] = defaultdict(int)
         try:
+            prepared_inputs: list[dict[str, Any]] = []
             for turn in turns:
                 session_id = str(turn.get("session_id") or "session-1")
                 speaker = str(turn.get("speaker") or turn.get("role") or "unknown")
@@ -92,20 +105,31 @@ class LEAFIndexer:
                     for key, value in turn.items()
                     if key not in {"session_id", "speaker", "role", "text", "content", "timestamp"}
                 }
-                event, atoms, touched_object_count, state_subjects = self._append_single_turn(
-                    corpus_id=corpus_id,
-                    session_id=session_id,
-                    speaker=speaker,
-                    text=text,
-                    turn_index=turn_index,
-                    timestamp=timestamp,
-                    metadata=metadata,
+                prepared_inputs.append(
+                    {
+                        "corpus_id": corpus_id,
+                        "session_id": session_id,
+                        "speaker": speaker,
+                        "text": text,
+                        "turn_index": turn_index,
+                        "timestamp": timestamp,
+                        "metadata": metadata,
+                    }
                 )
-                events_written += 1
-                atoms_written += len(atoms)
-                objects_written += touched_object_count
-                touched_sessions.add(event.session_id)
-                touched_subjects.update(state_subjects)
+            prepared_turns = self._prepare_turns_parallel(
+                prepared_inputs,
+                max_workers=self._ingest_prepare_worker_count(),
+            )
+            apply_metrics = self._apply_prepared_turns(prepared_turns, ingest_mode=ingest_mode)
+            events_written = int(apply_metrics["events_written"])
+            atoms_written = int(apply_metrics["atoms_written"])
+            objects_written = int(apply_metrics["objects_written"])
+            state_candidates = int(apply_metrics["state_candidates"])
+            evidence_links_written = int(apply_metrics["evidence_links_written"])
+            for action, count in dict(apply_metrics["state_action_counts"]).items():
+                state_action_counts[str(action)] += int(count)
+            touched_sessions.update(apply_metrics["touched_sessions"])
+            touched_subjects.update(apply_metrics["touched_subjects"])
             for session_id in sorted(touched_sessions):
                 self._refresh_session_snapshot(corpus_id=corpus_id, title=title, session_id=session_id)
             for subject in sorted(touched_subjects):
@@ -116,14 +140,144 @@ class LEAFIndexer:
             self.store.rollback()
             raise
         return {
+            "ingest_elapsed_ms": round((time.perf_counter() - started_at) * 1000.0, 2),
+            "ingest_mode": ingest_mode,
+            "apply_strategy": str(apply_metrics.get("apply_strategy") or ingest_mode),
             "events_written": events_written,
             "atoms_written": atoms_written,
             "objects_written": objects_written,
+            "state_candidates": state_candidates,
+            "evidence_links_written": evidence_links_written,
+            "state_action_counts": dict(sorted(state_action_counts.items())),
+            "state_cache_metrics": dict(apply_metrics.get("state_cache_metrics") or {}),
             "touched_sessions": sorted(touched_sessions),
             "touched_subjects": sorted(touched_subjects),
         }
 
-    def _append_single_turn(
+    @staticmethod
+    def _normalize_ingest_mode(ingest_mode: str | None) -> str:
+        normalized = str(ingest_mode or INGEST_MODE_ONLINE).strip().lower()
+        if normalized not in INGEST_MODES:
+            allowed = ", ".join(sorted(INGEST_MODES))
+            raise ValueError(f"Unsupported ingest mode: {ingest_mode!r}. Expected one of: {allowed}")
+        return normalized
+
+    def _ingest_prepare_worker_count(self) -> int:
+        raw_value = str(os.environ.get("LEAF_INGEST_PREPARE_WORKERS", "")).strip()
+        if raw_value:
+            try:
+                return max(1, int(raw_value))
+            except ValueError:
+                return 4
+        return 4
+
+    def _prepare_turns_parallel(
+        self,
+        prepared_inputs: list[dict[str, Any]],
+        *,
+        max_workers: int,
+    ) -> list[dict[str, Any]]:
+        if not prepared_inputs:
+            return []
+        if max_workers <= 1 or len(prepared_inputs) == 1:
+            return [self._prepare_single_turn(**payload) for payload in prepared_inputs]
+        ordered_results: list[dict[str, Any] | None] = [None] * len(prepared_inputs)
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(prepared_inputs))) as executor:
+            futures = [
+                executor.submit(self._prepare_single_turn, **payload)
+                for payload in prepared_inputs
+            ]
+            for index, future in enumerate(futures):
+                ordered_results[index] = future.result()
+        return [result for result in ordered_results if result is not None]
+
+    def _apply_prepared_turns(
+        self,
+        prepared_turns: list[dict[str, Any]],
+        *,
+        ingest_mode: str,
+    ) -> dict[str, Any]:
+        if ingest_mode == INGEST_MODE_MIGRATION:
+            return self._apply_prepared_turns_migration(prepared_turns)
+        return self._apply_prepared_turns_online(prepared_turns)
+
+    def _apply_prepared_turns_online(self, prepared_turns: list[dict[str, Any]]) -> dict[str, Any]:
+        touched_sessions: set[str] = set()
+        touched_subjects: set[str] = set()
+        state_action_counts: dict[str, int] = defaultdict(int)
+        metrics = {
+            "apply_strategy": "store_serial",
+            "events_written": 0,
+            "atoms_written": 0,
+            "objects_written": 0,
+            "state_candidates": 0,
+            "evidence_links_written": 0,
+            "state_action_counts": state_action_counts,
+            "touched_sessions": touched_sessions,
+            "touched_subjects": touched_subjects,
+            "state_cache_metrics": {
+                "enabled": False,
+                "object_hits": 0,
+                "object_misses": 0,
+            },
+        }
+        for prepared_turn in prepared_turns:
+            event, atoms, touched_object_count, state_subjects, turn_metrics = self._apply_prepared_turn(prepared_turn)
+            metrics["events_written"] += 1
+            metrics["atoms_written"] += len(atoms)
+            metrics["objects_written"] += touched_object_count
+            metrics["state_candidates"] += int(turn_metrics["state_candidates"])
+            metrics["evidence_links_written"] += int(turn_metrics["evidence_links_written"])
+            for action, count in dict(turn_metrics["state_action_counts"]).items():
+                state_action_counts[str(action)] += int(count)
+            touched_sessions.add(event.session_id)
+            touched_subjects.update(state_subjects)
+        return metrics
+
+    def _apply_prepared_turns_migration(self, prepared_turns: list[dict[str, Any]]) -> dict[str, Any]:
+        touched_sessions: set[str] = set()
+        touched_subjects: set[str] = set()
+        state_action_counts: dict[str, int] = defaultdict(int)
+        object_cache: dict[str, MemoryObjectRecord | None] = {}
+        latest_version_cache: dict[str, MemoryObjectVersionRecord | None] = {}
+        state_cache_metrics = {
+            "enabled": True,
+            "object_hits": 0,
+            "object_misses": 0,
+            "cached_objects": 0,
+        }
+        metrics = {
+            "apply_strategy": "state_cache_serial",
+            "events_written": 0,
+            "atoms_written": 0,
+            "objects_written": 0,
+            "state_candidates": 0,
+            "evidence_links_written": 0,
+            "state_action_counts": state_action_counts,
+            "touched_sessions": touched_sessions,
+            "touched_subjects": touched_subjects,
+            "state_cache_metrics": state_cache_metrics,
+        }
+        for prepared_turn in prepared_turns:
+            event, atoms, touched_object_count, state_subjects, turn_metrics = self._apply_prepared_turn_with_state_cache(
+                prepared_turn,
+                object_cache=object_cache,
+                latest_version_cache=latest_version_cache,
+                state_cache_metrics=state_cache_metrics,
+            )
+            metrics["events_written"] += 1
+            metrics["atoms_written"] += len(atoms)
+            metrics["objects_written"] += touched_object_count
+            metrics["state_candidates"] += int(turn_metrics["state_candidates"])
+            metrics["evidence_links_written"] += int(turn_metrics["evidence_links_written"])
+            for action, count in dict(turn_metrics["state_action_counts"]).items():
+                state_action_counts[str(action)] += int(count)
+            touched_sessions.add(event.session_id)
+            touched_subjects.update(state_subjects)
+        state_cache_metrics["cached_objects"] = len(object_cache)
+        return metrics
+
+    def _prepare_single_turn(
         self,
         corpus_id: str,
         session_id: str,
@@ -132,12 +286,13 @@ class LEAFIndexer:
         turn_index: int,
         timestamp: str | None,
         metadata: dict[str, Any],
-    ) -> tuple[MemoryEventRecord, list[MemoryAtomRecord], int, set[str]]:
+    ) -> dict[str, Any]:
         surface = span_surface_text(speaker, text, metadata)
         semantic_refs = extract_semantic_references(surface)
+        effective_metadata = dict(metadata)
         if semantic_refs:
-            metadata["semantic_refs"] = semantic_refs
-        metadata["temporal_grounding"] = derive_temporal_grounding(text=surface, timestamp=timestamp)
+            effective_metadata["semantic_refs"] = semantic_refs
+        effective_metadata["temporal_grounding"] = derive_temporal_grounding(text=surface, timestamp=timestamp)
         span = RawSpan(
             span_id=stable_id("leaf_raw", corpus_id, session_id, str(turn_index), speaker, text),
             corpus_id=corpus_id,
@@ -146,7 +301,7 @@ class LEAFIndexer:
             text=text,
             turn_index=turn_index,
             timestamp=timestamp,
-            metadata=metadata,
+            metadata=effective_metadata,
             embedding=None,
         )
         raw_refs = extract_entities(text) + semantic_refs
@@ -162,7 +317,7 @@ class LEAFIndexer:
             raw_span_id=span.span_id,
             entity_refs=list(dict.fromkeys(raw_refs))[:12],
             canonical_entity_refs=canonical_refs[:12],
-            metadata=metadata,
+            metadata=effective_metadata,
             embedding=self._embed_text(surface),
         )
         extracted_atoms = self.atom_extractor.extract_atoms(span)
@@ -187,13 +342,29 @@ class LEAFIndexer:
             for atom in extracted_atoms
         ]
         event.atom_ids = [atom.atom_id for atom in atoms]
+        return {
+            "event": event,
+            "atoms": atoms,
+            "state_candidates": self._derive_state_candidates(event=event, atoms=atoms),
+        }
+
+    def _apply_prepared_turn(
+        self,
+        prepared_turn: dict[str, Any],
+    ) -> tuple[MemoryEventRecord, list[MemoryAtomRecord], int, set[str], dict[str, Any]]:
+        event = prepared_turn["event"]
+        atoms = list(prepared_turn.get("atoms") or [])
+        state_candidates = list(prepared_turn.get("state_candidates") or [])
         self.store.add_event(event)
         for atom in atoms:
             self.store.add_atom(atom)
         touched_subjects: set[str] = set()
         touched_object_count = 0
-        for candidate in self._derive_state_candidates(event=event, atoms=atoms):
+        evidence_links_written = 0
+        state_action_counts: dict[str, int] = defaultdict(int)
+        for candidate in state_candidates:
             action, target_object, target_version, reason = self._decide_state_action(candidate)
+            state_action_counts[action] += 1
             if action == "NONE":
                 if target_object is not None and target_version is not None:
                     self._add_evidence_link(
@@ -203,6 +374,7 @@ class LEAFIndexer:
                         role="support",
                         reason=reason,
                     )
+                    evidence_links_written += 1
                     touched_subjects.add(target_object.subject)
                 continue
             if action == "ADD":
@@ -210,6 +382,7 @@ class LEAFIndexer:
                 self.store.upsert_object(obj)
                 self.store.add_version(version)
                 self._add_evidence_link(candidate, obj.object_id, version.version_id, "origin", reason)
+                evidence_links_written += 1
                 touched_subjects.add(obj.subject)
                 touched_object_count += 1
                 continue
@@ -218,6 +391,7 @@ class LEAFIndexer:
                 self.store.upsert_object(obj)
                 self.store.add_version(version)
                 self._add_evidence_link(candidate, obj.object_id, version.version_id, "origin", reason)
+                evidence_links_written += 1
                 touched_subjects.add(obj.subject)
                 touched_object_count += 1
                 continue
@@ -228,6 +402,7 @@ class LEAFIndexer:
                 version = self._new_version(candidate, target_object.object_id, operation="TENTATIVE", status="tentative")
                 self.store.add_version(version)
                 self._add_evidence_link(candidate, target_object.object_id, version.version_id, "tentative", reason)
+                evidence_links_written += 1
                 touched_subjects.add(target_object.subject)
                 touched_object_count += 1
                 continue
@@ -253,9 +428,121 @@ class LEAFIndexer:
             self.store.upsert_object(target_object)
             self.store.add_version(version)
             self._add_evidence_link(candidate, target_object.object_id, version.version_id, "update", reason)
+            evidence_links_written += 1
             touched_subjects.add(target_object.subject)
             touched_object_count += 1
-        return event, atoms, touched_object_count, touched_subjects
+        return event, atoms, touched_object_count, touched_subjects, {
+            "state_candidates": len(state_candidates),
+            "state_action_counts": dict(sorted(state_action_counts.items())),
+            "evidence_links_written": evidence_links_written,
+        }
+
+    def _apply_prepared_turn_with_state_cache(
+        self,
+        prepared_turn: dict[str, Any],
+        *,
+        object_cache: dict[str, MemoryObjectRecord | None],
+        latest_version_cache: dict[str, MemoryObjectVersionRecord | None],
+        state_cache_metrics: dict[str, int | bool],
+    ) -> tuple[MemoryEventRecord, list[MemoryAtomRecord], int, set[str], dict[str, Any]]:
+        event = prepared_turn["event"]
+        atoms = list(prepared_turn.get("atoms") or [])
+        state_candidates = list(prepared_turn.get("state_candidates") or [])
+        self.store.add_event(event)
+        for atom in atoms:
+            self.store.add_atom(atom)
+        touched_subjects: set[str] = set()
+        touched_object_count = 0
+        evidence_links_written = 0
+        state_action_counts: dict[str, int] = defaultdict(int)
+        for candidate in state_candidates:
+            action, target_object, target_version, reason = self._decide_state_action_with_cache(
+                candidate,
+                object_cache=object_cache,
+                latest_version_cache=latest_version_cache,
+                state_cache_metrics=state_cache_metrics,
+            )
+            state_action_counts[action] += 1
+            if action == "NONE":
+                if target_object is not None and target_version is not None:
+                    self._add_evidence_link(
+                        candidate=candidate,
+                        object_id=target_object.object_id,
+                        version_id=target_version.version_id,
+                        role="support",
+                        reason=reason,
+                    )
+                    evidence_links_written += 1
+                    touched_subjects.add(target_object.subject)
+                continue
+            if action == "ADD":
+                obj, version = self._create_object_and_version(candidate, operation="ADD", status="active")
+                self.store.upsert_object(obj)
+                self.store.add_version(version)
+                object_cache[obj.object_id] = obj
+                latest_version_cache[obj.object_id] = version
+                self._add_evidence_link(candidate, obj.object_id, version.version_id, "origin", reason)
+                evidence_links_written += 1
+                touched_subjects.add(obj.subject)
+                touched_object_count += 1
+                continue
+            if target_object is None:
+                obj, version = self._create_object_and_version(candidate, operation=action, status="active")
+                self.store.upsert_object(obj)
+                self.store.add_version(version)
+                object_cache[obj.object_id] = obj
+                latest_version_cache[obj.object_id] = version
+                self._add_evidence_link(candidate, obj.object_id, version.version_id, "origin", reason)
+                evidence_links_written += 1
+                touched_subjects.add(obj.subject)
+                touched_object_count += 1
+                continue
+            if action == "TENTATIVE":
+                target_object.status = "active"
+                target_object.updated_at_event_id = candidate.event_id
+                self.store.upsert_object(target_object)
+                object_cache[target_object.object_id] = target_object
+                version = self._new_version(candidate, target_object.object_id, operation="TENTATIVE", status="tentative")
+                self.store.add_version(version)
+                self._add_evidence_link(candidate, target_object.object_id, version.version_id, "tentative", reason)
+                evidence_links_written += 1
+                touched_subjects.add(target_object.subject)
+                touched_object_count += 1
+                continue
+            if target_version is not None:
+                self.store.update_version_window(
+                    version_id=target_version.version_id,
+                    status="superseded",
+                    valid_to=candidate.valid_from,
+                )
+                target_version.status = "superseded"
+                target_version.valid_to = candidate.valid_from
+            version = self._new_version(
+                candidate,
+                target_object.object_id,
+                operation=action,
+                status="active",
+                metadata={"previous_version_id": target_version.version_id if target_version else None, "reason": reason},
+            )
+            target_object.latest_version_id = version.version_id
+            target_object.updated_at_event_id = candidate.event_id
+            target_object.status = "active"
+            target_object.canonical_entities = list(
+                dict.fromkeys(target_object.canonical_entities + [candidate.subject])
+            )[:8]
+            self.store.upsert_object(target_object)
+            self.store.add_version(version)
+            object_cache[target_object.object_id] = target_object
+            latest_version_cache[target_object.object_id] = version
+            self._add_evidence_link(candidate, target_object.object_id, version.version_id, "update", reason)
+            evidence_links_written += 1
+            touched_subjects.add(target_object.subject)
+            touched_object_count += 1
+        return event, atoms, touched_object_count, touched_subjects, {
+            "state_candidates": len(state_candidates),
+            "state_action_counts": dict(sorted(state_action_counts.items())),
+            "evidence_links_written": evidence_links_written,
+        }
 
     def _derive_state_candidates(
         self,
@@ -305,6 +592,38 @@ class LEAFIndexer:
         object_id = self._object_id_for_candidate(candidate)
         obj = self.store.get_object(object_id)
         version = self.store.get_latest_version(object_id) if obj else None
+        return self._decide_state_action_from_current(candidate=candidate, obj=obj, version=version)
+
+    def _decide_state_action_with_cache(
+        self,
+        candidate: StateCandidate,
+        *,
+        object_cache: dict[str, MemoryObjectRecord | None],
+        latest_version_cache: dict[str, MemoryObjectVersionRecord | None],
+        state_cache_metrics: dict[str, int | bool],
+    ) -> tuple[str, MemoryObjectRecord | None, MemoryObjectVersionRecord | None, str]:
+        object_id = self._object_id_for_candidate(candidate)
+        if object_id in object_cache:
+            state_cache_metrics["object_hits"] = int(state_cache_metrics.get("object_hits", 0)) + 1
+            obj = object_cache[object_id]
+            version = latest_version_cache.get(object_id)
+        else:
+            state_cache_metrics["object_misses"] = int(state_cache_metrics.get("object_misses", 0)) + 1
+            loaded_object = self.store.get_object(object_id)
+            obj = self._copy_object_record(loaded_object) if loaded_object is not None else None
+            loaded_version = self.store.get_latest_version(object_id) if loaded_object else None
+            version = self._copy_version_record(loaded_version) if loaded_version is not None else None
+            object_cache[object_id] = obj
+            latest_version_cache[object_id] = version
+        return self._decide_state_action_from_current(candidate=candidate, obj=obj, version=version)
+
+    def _decide_state_action_from_current(
+        self,
+        *,
+        candidate: StateCandidate,
+        obj: MemoryObjectRecord | None,
+        version: MemoryObjectVersionRecord | None,
+    ) -> tuple[str, MemoryObjectRecord | None, MemoryObjectVersionRecord | None, str]:
         if obj is None or version is None:
             return "ADD", obj, version, "new_object"
         if version.normalized_value == candidate.normalized_value:
@@ -328,6 +647,18 @@ class LEAFIndexer:
         if llm_action == "NONE":
             return "NONE", obj, version, "llm_duplicate"
         return "SUPERSEDE", obj, version, "default_supersede"
+
+    @staticmethod
+    def _copy_object_record(record: MemoryObjectRecord | None) -> MemoryObjectRecord | None:
+        if record is None:
+            return None
+        return MemoryObjectRecord(**record.to_dict())
+
+    @staticmethod
+    def _copy_version_record(record: MemoryObjectVersionRecord | None) -> MemoryObjectVersionRecord | None:
+        if record is None:
+            return None
+        return MemoryObjectVersionRecord(**record.to_dict())
 
     def _create_object_and_version(
         self,

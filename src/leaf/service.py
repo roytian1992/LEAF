@@ -7,7 +7,7 @@ from typing import Any
 from .clients import ChatClient, EmbeddingClient
 from .config import load_config
 from .extract import AtomExtractor
-from .indexer import LEAFIndexer
+from .indexer import INGEST_MODE_MIGRATION, INGEST_MODE_ONLINE, LEAFIndexer
 from .store import SQLiteMemoryStore
 from .search import retrieve_leaf_memory
 
@@ -33,14 +33,47 @@ class LEAFService:
     def close(self) -> None:
         self.store.close()
 
-    def append_json(self, corpus_id: str, title: str, path: str | Path) -> dict[str, Any]:
+    def append_json(
+        self,
+        corpus_id: str,
+        title: str,
+        path: str | Path,
+        ingest_mode: str = INGEST_MODE_ONLINE,
+    ) -> dict[str, Any]:
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
         turns = self._normalize_turns(payload)
-        return self.append_turns(corpus_id=corpus_id, title=title, turns=turns)
+        return self.append_turns(corpus_id=corpus_id, title=title, turns=turns, ingest_mode=ingest_mode)
 
-    def append_turns(self, corpus_id: str, title: str, turns: list[dict[str, Any]]) -> dict[str, Any]:
-        return self.indexer.append_turns(corpus_id=corpus_id, title=title, turns=turns)
+    def append_turns(
+        self,
+        corpus_id: str,
+        title: str,
+        turns: list[dict[str, Any]],
+        ingest_mode: str = INGEST_MODE_ONLINE,
+    ) -> dict[str, Any]:
+        return self.indexer.append_turns(
+            corpus_id=corpus_id,
+            title=title,
+            turns=turns,
+            ingest_mode=ingest_mode,
+        )
+
+    def append_turns_online(self, corpus_id: str, title: str, turns: list[dict[str, Any]]) -> dict[str, Any]:
+        return self.append_turns(
+            corpus_id=corpus_id,
+            title=title,
+            turns=turns,
+            ingest_mode=INGEST_MODE_ONLINE,
+        )
+
+    def migrate_turns(self, corpus_id: str, title: str, turns: list[dict[str, Any]]) -> dict[str, Any]:
+        return self.append_turns(
+            corpus_id=corpus_id,
+            title=title,
+            turns=turns,
+            ingest_mode=INGEST_MODE_MIGRATION,
+        )
 
     def search(self, corpus_id: str, question: str, raw_span_limit: int = 8) -> dict[str, Any]:
         if self.embedding is None:
@@ -131,5 +164,4 @@ class LEAFService:
             if isinstance(payload.get("messages"), list):
                 return [item for item in payload["messages"] if isinstance(item, dict)]
         raise ValueError("Unsupported conversation JSON format")
-
 

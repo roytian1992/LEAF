@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -184,6 +185,87 @@ class LEAFSmokeTest(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_online_and_migration_ingest_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            config_path = tmp / "config.yaml"
+            online_db_path = tmp / "online.sqlite3"
+            migration_db_path = tmp / "migration.sqlite3"
+            base_url = f"http://127.0.0.1:{self.port}/v1"
+
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "llm:",
+                        "  provider: openai",
+                        "  model_name: mock-chat",
+                        "  api_key: mock-key",
+                        f"  base_url: {base_url}",
+                        "",
+                        "embedding:",
+                        "  provider: openai",
+                        "  model_name: mock-embed",
+                        "  api_key: mock-key",
+                        f"  base_url: {base_url}",
+                        "",
+                        "additional_llm:",
+                        "  provider: openai",
+                        "  model_name: mock-memory",
+                        "  api_key: mock-key",
+                        f"  base_url: {base_url}",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            turns = [
+                {
+                    "session_id": "session-1",
+                    "speaker": "Caroline",
+                    "text": "I live in Boston and work at Acme.",
+                    "timestamp": "2025-01-01T10:00:00",
+                },
+                {
+                    "session_id": "session-2",
+                    "speaker": "Daniel",
+                    "text": "Caroline now lives in Seattle.",
+                    "timestamp": "2025-01-02T10:00:00",
+                },
+                {
+                    "session_id": "session-1",
+                    "speaker": "Caroline",
+                    "text": "I now live in Seattle and still work at Acme.",
+                    "timestamp": "2025-01-03T10:00:00",
+                },
+            ]
+
+            online_service = LEAFService(config_path=config_path, db_path=online_db_path)
+            migration_service = LEAFService(config_path=config_path, db_path=migration_db_path)
+            try:
+                online_result = online_service.append_turns_online(
+                    corpus_id="demo",
+                    title="Mode Match",
+                    turns=turns,
+                )
+                migration_result = migration_service.migrate_turns(
+                    corpus_id="demo",
+                    title="Mode Match",
+                    turns=turns,
+                )
+                self.assertEqual(online_result["ingest_mode"], "online")
+                self.assertEqual(migration_result["ingest_mode"], "migration")
+                self.assertEqual(migration_result["apply_strategy"], "state_cache_serial")
+                self.assertTrue(migration_result["state_cache_metrics"]["enabled"])
+            finally:
+                online_service.close()
+                migration_service.close()
+
+            self.assertEqual(
+                self._dump_core_tables(online_db_path),
+                self._dump_core_tables(migration_db_path),
+            )
+
     def test_cli_help(self) -> None:
         env = dict(os.environ)
         pythonpath = str(SRC)
@@ -200,6 +282,27 @@ class LEAFSmokeTest(unittest.TestCase):
             check=True,
         )
         self.assertIn("LEAF CLI", result.stdout)
+
+    @staticmethod
+    def _dump_core_tables(path: Path) -> dict[str, list[dict[str, object]]]:
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        try:
+            tables = [
+                "leaf_events",
+                "leaf_atoms",
+                "leaf_objects",
+                "leaf_object_versions",
+                "leaf_evidence_links",
+                "leaf_snapshots",
+            ]
+            dumped: dict[str, list[dict[str, object]]] = {}
+            for table in tables:
+                rows = conn.execute(f"select * from {table} order by 1").fetchall()
+                dumped[table] = [dict(row) for row in rows]
+            return dumped
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":

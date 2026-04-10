@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 
+from .indexer import INGEST_MODES, INGEST_MODE_ONLINE
 from .service import LEAFService
 
 
@@ -16,6 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--corpus-id", required=True)
     ingest.add_argument("--title", required=True)
     ingest.add_argument("--input", required=True)
+    ingest.add_argument("--ingest-mode", choices=sorted(INGEST_MODES), default=INGEST_MODE_ONLINE)
 
     search = subparsers.add_parser("search", help="Search memory using LEAF retrieval")
     search.add_argument("--corpus-id", required=True)
@@ -47,7 +49,12 @@ def main() -> None:
     service = LEAFService(config_path=args.config, db_path=args.db)
     try:
         if args.command == "ingest-json":
-            result = service.append_json(corpus_id=args.corpus_id, title=args.title, path=args.input)
+            result = service.append_json(
+                corpus_id=args.corpus_id,
+                title=args.title,
+                path=args.input,
+                ingest_mode=args.ingest_mode,
+            )
         elif args.command == "search":
             result = service.search(corpus_id=args.corpus_id, question=args.text, raw_span_limit=args.raw_span_limit)
         elif args.command == "get-root":
