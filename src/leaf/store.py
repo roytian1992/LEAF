@@ -384,6 +384,39 @@ class SQLiteMemoryStore:
         ).fetchall()
         return [self._row_to_snapshot(row) for row in rows]
 
+    def get_objects(self, corpus_id: str) -> list[MemoryObjectRecord]:
+        rows = self.conn.execute(
+            """
+            select * from leaf_objects
+            where corpus_id = ?
+            order by subject, slot, object_id
+            """,
+            (corpus_id,),
+        ).fetchall()
+        return [self._row_to_object(row) for row in rows]
+
+    def get_object_versions_for_corpus(self, corpus_id: str) -> list[MemoryObjectVersionRecord]:
+        rows = self.conn.execute(
+            """
+            select * from leaf_object_versions
+            where corpus_id = ?
+            order by object_id, coalesce(valid_from, ''), version_id
+            """,
+            (corpus_id,),
+        ).fetchall()
+        return [self._row_to_version(row) for row in rows]
+
+    def get_evidence_links(self, corpus_id: str) -> list[MemoryEvidenceLinkRecord]:
+        rows = self.conn.execute(
+            """
+            select * from leaf_evidence_links
+            where corpus_id = ?
+            order by event_id, object_id, link_id
+            """,
+            (corpus_id,),
+        ).fetchall()
+        return [self._row_to_link(row) for row in rows]
+
     def get_object(self, object_id: str) -> MemoryObjectRecord | None:
         row = self.conn.execute(
             "select * from leaf_objects where object_id = ?",
@@ -582,4 +615,18 @@ class SQLiteMemoryStore:
             time_range=row["time_range"],
             metadata=dict(_json_loads(row["metadata_json"], {})),
             embedding=list(_json_loads(row["embedding_json"], [])) if row["embedding_json"] else None,
+        )
+
+    @staticmethod
+    def _row_to_link(row: sqlite3.Row) -> MemoryEvidenceLinkRecord:
+        return MemoryEvidenceLinkRecord(
+            link_id=str(row["link_id"]),
+            corpus_id=str(row["corpus_id"]),
+            object_id=str(row["object_id"]),
+            version_id=row["version_id"],
+            event_id=str(row["event_id"]),
+            span_id=str(row["span_id"]),
+            atom_id=row["atom_id"],
+            role=str(row["role"]),
+            metadata=dict(_json_loads(row["metadata_json"], {})),
         )

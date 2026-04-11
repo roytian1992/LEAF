@@ -140,21 +140,29 @@ class LEAFIndexer:
             touched_sessions.update(apply_metrics["touched_sessions"])
             touched_subjects.update(apply_metrics["touched_subjects"])
             snapshot_started_at = time.perf_counter()
-            session_snapshots = [
-                self._build_session_snapshot(corpus_id=corpus_id, title=title, session_id=session_id)
-                for session_id in sorted(touched_sessions)
-            ]
-            entity_snapshots = [
-                self._build_entity_snapshot(corpus_id=corpus_id, title=title, subject=subject)
-                for subject in sorted(touched_subjects)
-            ]
+            if ingest_mode == INGEST_MODE_MIGRATION:
+                session_snapshots, entity_snapshots, root_snapshot = self._build_snapshots_migration(
+                    corpus_id=corpus_id,
+                    title=title,
+                    touched_sessions=sorted(touched_sessions),
+                    touched_subjects=sorted(touched_subjects),
+                )
+            else:
+                session_snapshots = [
+                    self._build_session_snapshot(corpus_id=corpus_id, title=title, session_id=session_id)
+                    for session_id in sorted(touched_sessions)
+                ]
+                entity_snapshots = [
+                    self._build_entity_snapshot(corpus_id=corpus_id, title=title, subject=subject)
+                    for subject in sorted(touched_subjects)
+                ]
+                root_snapshot = self._build_root_snapshot(
+                    corpus_id=corpus_id,
+                    title=title,
+                    session_snapshots=session_snapshots,
+                    entity_snapshots=entity_snapshots,
+                )
             self._upsert_snapshots_with_embeddings(session_snapshots + entity_snapshots)
-            root_snapshot = self._build_root_snapshot(
-                corpus_id=corpus_id,
-                title=title,
-                session_snapshots=session_snapshots,
-                entity_snapshots=entity_snapshots,
-            )
             self._upsert_snapshots_with_embeddings([root_snapshot])
             snapshot_elapsed_ms = round((time.perf_counter() - snapshot_started_at) * 1000.0, 2)
             self.store.commit()
@@ -332,7 +340,6 @@ class LEAFIndexer:
         return prepared_turns
 
     def _apply_prepared_turns(
-
         self,
         prepared_turns: list[dict[str, Any]],
         *,
@@ -869,6 +876,115 @@ class LEAFIndexer:
             snapshot.embedding = embedding
             self.store.upsert_snapshot(snapshot)
 
+    def _build_snapshots_migration(
+        self,
+        *,
+        corpus_id: str,
+        title: str,
+        touched_sessions: list[str],
+        touched_subjects: list[str],
+    ) -> tuple[list[MemorySnapshotRecord], list[MemorySnapshotRecord], MemorySnapshotRecord]:
+        events = self.store.get_events(corpus_id=corpus_id)
+        objects = self.store.get_objects(corpus_id=corpus_id)
+        versions = self.store.get_object_versions_for_corpus(corpus_id=corpus_id)
+        links = self.store.get_evidence_links(corpus_id=corpus_id)
+
+        events_by_id = {event.event_id: event for event in events}
+        events_by_session: dict[str, list[MemoryEventRecord]] = defaultdict(list)
+        for event in events:
+            events_by_session[event.session_id].append(event)
+
+        objects_by_id = {obj.object_id: obj for obj in objects}
+        objects_by_subject: dict[str, list[MemoryObjectRecord]] = defaultdict(list)
+        for obj in objects:
+            objects_by_subject[obj.subject].append(obj)
+
+        versions_by_id = {version.version_id: version for version in versions}
+        versions_by_object: dict[str, list[MemoryObjectVersionRecord]] = defaultdict(list)
+        for version in versions:
+            versions_by_object[version.object_id].append(version)
+
+        latest_versions_by_object: dict[str, MemoryObjectVersionRecord] = {}
+        for obj in objects:
+            if obj.latest_version_id and obj.latest_version_id in versions_by_id:
+                latest_versions_by_object[obj.object_id] = versions_by_id[obj.latest_version_id]
+
+        touched_session_set = set(touched_sessions)
+        touched_subject_set = set(touched_subjects)
+        session_object_ids: dict[str, set[str]] = defaultdict(set)
+        linked_subjects_by_event: dict[str, set[str]] = defaultdict(set)
+        for link in links:
+            event = events_by_id.get(link.event_id)
+            obj = objects_by_id.get(link.object_id)
+            if event is None or obj is None:
+                continue
+            if event.session_id in touched_session_set:
+                session_object_ids[event.session_id].add(obj.object_id)
+            if obj.subject in touched_subject_set:
+                linked_subjects_by_event[event.event_id].add(obj.subject)
+
+        subject_events: dict[str, list[MemoryEventRecord]] = {subject: [] for subject in touched_subjects}
+        subject_seen_event_ids: dict[str, set[str]] = {subject: set() for subject in touched_subjects}
+        for event in events:
+            event_subjects = set(linked_subjects_by_event.get(event.event_id) or set())
+            event_subjects.update(subject for subject in event.canonical_entity_refs if subject in touched_subject_set)
+            for subject in event_subjects:
+                seen_event_ids = subject_seen_event_ids[subject]
+                if event.event_id in seen_event_ids:
+                    continue
+                seen_event_ids.add(event.event_id)
+                subject_events[subject].append(event)
+
+        session_snapshots = [
+            self._build_session_snapshot_from_state(
+                corpus_id=corpus_id,
+                title=title,
+                session_id=session_id,
+                events=events_by_session.get(session_id) or [],
+                object_ids=sorted(
+                    session_object_ids.get(session_id) or set(),
+                    key=lambda object_id: (
+                        objects_by_id[object_id].subject,
+                        objects_by_id[object_id].slot,
+                        objects_by_id[object_id].object_id,
+                    ),
+                ),
+                latest_versions_by_object=latest_versions_by_object,
+            )
+            for session_id in touched_sessions
+        ]
+        entity_snapshots = []
+        for subject in touched_subjects:
+            subject_recent_events_asc = subject_events.get(subject) or []
+            subject_events_by_session: dict[str, list[MemoryEventRecord]] = defaultdict(list)
+            for event in subject_recent_events_asc:
+                subject_events_by_session[event.session_id].append(event)
+            limited_events_desc: list[MemoryEventRecord] = []
+            for session_id in sorted(subject_events_by_session):
+                for event in reversed(subject_events_by_session[session_id]):
+                    limited_events_desc.append(event)
+                    if len(limited_events_desc) >= 12:
+                        break
+                if len(limited_events_desc) >= 12:
+                    break
+            entity_snapshots.append(
+                self._build_entity_snapshot_from_state(
+                    corpus_id=corpus_id,
+                    title=title,
+                    subject=subject,
+                    objects=objects_by_subject.get(subject) or [],
+                    versions_by_object=versions_by_object,
+                    recent_events=list(reversed(limited_events_desc)),
+                )
+            )
+        root_snapshot = self._build_root_snapshot(
+            corpus_id=corpus_id,
+            title=title,
+            session_snapshots=session_snapshots,
+            entity_snapshots=entity_snapshots,
+        )
+        return session_snapshots, entity_snapshots, root_snapshot
+
     def _create_object_and_version(
         self,
         candidate: StateCandidate,
@@ -949,15 +1065,38 @@ class LEAFIndexer:
     def _build_session_snapshot(self, corpus_id: str, title: str, session_id: str) -> MemorySnapshotRecord:
         events = self.store.get_events(corpus_id=corpus_id, session_id=session_id)
         objects = self.store.get_objects_for_session(corpus_id=corpus_id, session_id=session_id)
-        active_summaries: list[str] = []
+        latest_versions_by_object: dict[str, MemoryObjectVersionRecord] = {}
         object_ids: list[str] = []
         for obj in objects:
             version = self.store.get_latest_version(obj.object_id)
             if version is None:
                 continue
             object_ids.append(obj.object_id)
-            if version.status == "active":
-                active_summaries.append(version.summary)
+            latest_versions_by_object[obj.object_id] = version
+        return self._build_session_snapshot_from_state(
+            corpus_id=corpus_id,
+            title=title,
+            session_id=session_id,
+            events=events,
+            object_ids=object_ids,
+            latest_versions_by_object=latest_versions_by_object,
+        )
+
+    def _build_session_snapshot_from_state(
+        self,
+        *,
+        corpus_id: str,
+        title: str,
+        session_id: str,
+        events: list[MemoryEventRecord],
+        object_ids: list[str],
+        latest_versions_by_object: dict[str, MemoryObjectVersionRecord],
+    ) -> MemorySnapshotRecord:
+        active_summaries = [
+            latest_versions_by_object[object_id].summary
+            for object_id in object_ids
+            if object_id in latest_versions_by_object and latest_versions_by_object[object_id].status == "active"
+        ]
         event_texts = [f"{event.speaker}: {event.text}" for event in events]
         summary = summarize_texts(active_summaries + event_texts, max_chars=760)
         synopsis = make_synopsis(active_summaries[:4] + event_texts[:4], max_chars=180)
@@ -989,13 +1128,35 @@ class LEAFIndexer:
 
     def _build_entity_snapshot(self, corpus_id: str, title: str, subject: str) -> MemorySnapshotRecord:
         objects = self.store.get_objects_for_subject(corpus_id=corpus_id, subject=subject)
+        versions_by_object: dict[str, list[MemoryObjectVersionRecord]] = {}
+        for obj in objects:
+            versions_by_object[obj.object_id] = self.store.get_object_versions(obj.object_id)
+        recent_events = self.store.get_events_for_entity(corpus_id=corpus_id, entity=subject, limit=12)
+        return self._build_entity_snapshot_from_state(
+            corpus_id=corpus_id,
+            title=title,
+            subject=subject,
+            objects=objects,
+            versions_by_object=versions_by_object,
+            recent_events=recent_events,
+        )
+
+    def _build_entity_snapshot_from_state(
+        self,
+        *,
+        corpus_id: str,
+        title: str,
+        subject: str,
+        objects: list[MemoryObjectRecord],
+        versions_by_object: dict[str, list[MemoryObjectVersionRecord]],
+        recent_events: list[MemoryEventRecord],
+    ) -> MemorySnapshotRecord:
         versions: list[MemoryObjectVersionRecord] = []
         object_ids: list[str] = []
         for obj in objects:
             object_ids.append(obj.object_id)
-            versions.extend(self.store.get_object_versions(obj.object_id))
+            versions.extend(versions_by_object.get(obj.object_id) or [])
         active_versions = [version.summary for version in versions if version.status == "active"]
-        recent_events = self.store.get_events_for_entity(corpus_id=corpus_id, entity=subject, limit=12)
         event_texts = [f"{event.speaker}: {event.text}" for event in recent_events]
         summary = summarize_texts(active_versions + event_texts, max_chars=760)
         synopsis = make_synopsis(active_versions[:4] + event_texts[:4], max_chars=180)
