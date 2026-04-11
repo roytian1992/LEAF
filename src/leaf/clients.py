@@ -89,6 +89,31 @@ class EmbeddingClient:
         except (KeyError, IndexError, TypeError) as exc:
             raise OpenAICompatError(f"Unexpected embedding response: {response}") from exc
 
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        payload = {
+            "model": self.config.model_name,
+            "input": texts,
+        }
+        response = _post_json(
+            url=f"{self.config.base_url}/embeddings",
+            payload=payload,
+            api_key=self.config.api_key,
+            timeout=self.config.timeout,
+        )
+        try:
+            items = list(response["data"])
+            embeddings: list[list[float] | None] = [None] * len(texts)
+            for item in items:
+                index = int(item["index"])
+                embeddings[index] = list(item["embedding"])
+            if any(embedding is None for embedding in embeddings):
+                raise KeyError("missing_embedding")
+            return [embedding for embedding in embeddings if embedding is not None]
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise OpenAICompatError(f"Unexpected embedding response: {response}") from exc
+
 
 def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
     if not vec_a or not vec_b or len(vec_a) != len(vec_b):

@@ -78,7 +78,45 @@ class LEAFIndexer:
     ) -> dict[str, Any]:
         ingest_mode = self._normalize_ingest_mode(ingest_mode)
         started_at = time.perf_counter()
-        per_session_index: dict[str, int] = {}
+        prepare_started_at = time.perf_counter()
+        prepared_turns = self.prepare_turns(corpus_id=corpus_id, turns=turns, ingest_mode=ingest_mode)
+        prepare_elapsed_ms = round((time.perf_counter() - prepare_started_at) * 1000.0, 2)
+        result = self.append_prepared_turns(
+            corpus_id=corpus_id,
+            title=title,
+            prepared_turns=prepared_turns,
+            ingest_mode=ingest_mode,
+        )
+        stage_timings_ms = dict(result.get("stage_timings_ms") or {})
+        stage_timings_ms["prepare_total_ms"] = prepare_elapsed_ms
+        result["stage_timings_ms"] = dict(sorted(stage_timings_ms.items()))
+        result["prepared_turn_count"] = len(prepared_turns)
+        result["ingest_elapsed_ms"] = round((time.perf_counter() - started_at) * 1000.0, 2)
+        return result
+
+    def prepare_turns(
+        self,
+        corpus_id: str,
+        turns: list[dict[str, Any]],
+        ingest_mode: str = INGEST_MODE_ONLINE,
+    ) -> list[dict[str, Any]]:
+        ingest_mode = self._normalize_ingest_mode(ingest_mode)
+        prepared_inputs = self._build_prepared_inputs(corpus_id=corpus_id, turns=turns)
+        return self._prepare_turns_parallel(
+            prepared_inputs,
+            max_workers=self._prepare_worker_count_for_mode(ingest_mode),
+        )
+
+    def append_prepared_turns(
+        self,
+        corpus_id: str,
+        title: str,
+        prepared_turns: list[dict[str, Any]],
+        ingest_mode: str = INGEST_MODE_ONLINE,
+    ) -> dict[str, Any]:
+        ingest_mode = self._normalize_ingest_mode(ingest_mode)
+        started_at = time.perf_counter()
+        apply_started_at = time.perf_counter()
         touched_sessions: set[str] = set()
         touched_subjects: set[str] = set()
         events_written = 0
@@ -87,40 +125,11 @@ class LEAFIndexer:
         state_candidates = 0
         evidence_links_written = 0
         state_action_counts: dict[str, int] = defaultdict(int)
+        apply_metrics: dict[str, Any] = {}
+        snapshot_elapsed_ms = 0.0
         try:
-            prepared_inputs: list[dict[str, Any]] = []
-            for turn in turns:
-                session_id = str(turn.get("session_id") or "session-1")
-                speaker = str(turn.get("speaker") or turn.get("role") or "unknown")
-                text = str(turn.get("text") or turn.get("content") or "").strip()
-                if not text:
-                    continue
-                if session_id not in per_session_index:
-                    per_session_index[session_id] = self.store.get_next_turn_index(corpus_id, session_id)
-                turn_index = per_session_index[session_id]
-                per_session_index[session_id] += 1
-                timestamp = str(turn.get("timestamp")) if turn.get("timestamp") else None
-                metadata = {
-                    key: value
-                    for key, value in turn.items()
-                    if key not in {"session_id", "speaker", "role", "text", "content", "timestamp"}
-                }
-                prepared_inputs.append(
-                    {
-                        "corpus_id": corpus_id,
-                        "session_id": session_id,
-                        "speaker": speaker,
-                        "text": text,
-                        "turn_index": turn_index,
-                        "timestamp": timestamp,
-                        "metadata": metadata,
-                    }
-                )
-            prepared_turns = self._prepare_turns_parallel(
-                prepared_inputs,
-                max_workers=self._ingest_prepare_worker_count(),
-            )
             apply_metrics = self._apply_prepared_turns(prepared_turns, ingest_mode=ingest_mode)
+            apply_elapsed_ms = round((time.perf_counter() - apply_started_at) * 1000.0, 2)
             events_written = int(apply_metrics["events_written"])
             atoms_written = int(apply_metrics["atoms_written"])
             objects_written = int(apply_metrics["objects_written"])
@@ -130,11 +139,24 @@ class LEAFIndexer:
                 state_action_counts[str(action)] += int(count)
             touched_sessions.update(apply_metrics["touched_sessions"])
             touched_subjects.update(apply_metrics["touched_subjects"])
-            for session_id in sorted(touched_sessions):
-                self._refresh_session_snapshot(corpus_id=corpus_id, title=title, session_id=session_id)
-            for subject in sorted(touched_subjects):
-                self._refresh_entity_snapshot(corpus_id=corpus_id, title=title, subject=subject)
-            self._refresh_root_snapshot(corpus_id=corpus_id, title=title)
+            snapshot_started_at = time.perf_counter()
+            session_snapshots = [
+                self._build_session_snapshot(corpus_id=corpus_id, title=title, session_id=session_id)
+                for session_id in sorted(touched_sessions)
+            ]
+            entity_snapshots = [
+                self._build_entity_snapshot(corpus_id=corpus_id, title=title, subject=subject)
+                for subject in sorted(touched_subjects)
+            ]
+            self._upsert_snapshots_with_embeddings(session_snapshots + entity_snapshots)
+            root_snapshot = self._build_root_snapshot(
+                corpus_id=corpus_id,
+                title=title,
+                session_snapshots=session_snapshots,
+                entity_snapshots=entity_snapshots,
+            )
+            self._upsert_snapshots_with_embeddings([root_snapshot])
+            snapshot_elapsed_ms = round((time.perf_counter() - snapshot_started_at) * 1000.0, 2)
             self.store.commit()
         except Exception:
             self.store.rollback()
@@ -152,7 +174,48 @@ class LEAFIndexer:
             "state_cache_metrics": dict(apply_metrics.get("state_cache_metrics") or {}),
             "touched_sessions": sorted(touched_sessions),
             "touched_subjects": sorted(touched_subjects),
+            "prepared_turn_count": len(prepared_turns),
+            "stage_timings_ms": {
+                "apply_total_ms": apply_elapsed_ms,
+                "snapshot_total_ms": snapshot_elapsed_ms,
+            },
         }
+
+    def _build_prepared_inputs(
+        self,
+        corpus_id: str,
+        turns: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        per_session_index: dict[str, int] = {}
+        prepared_inputs: list[dict[str, Any]] = []
+        for turn in turns:
+            session_id = str(turn.get("session_id") or "session-1")
+            speaker = str(turn.get("speaker") or turn.get("role") or "unknown")
+            text = str(turn.get("text") or turn.get("content") or "").strip()
+            if not text:
+                continue
+            if session_id not in per_session_index:
+                per_session_index[session_id] = self.store.get_next_turn_index(corpus_id, session_id)
+            turn_index = per_session_index[session_id]
+            per_session_index[session_id] += 1
+            timestamp = str(turn.get("timestamp")) if turn.get("timestamp") else None
+            metadata = {
+                key: value
+                for key, value in turn.items()
+                if key not in {"session_id", "speaker", "role", "text", "content", "timestamp"}
+            }
+            prepared_inputs.append(
+                {
+                    "corpus_id": corpus_id,
+                    "session_id": session_id,
+                    "speaker": speaker,
+                    "text": text,
+                    "turn_index": turn_index,
+                    "timestamp": timestamp,
+                    "metadata": metadata,
+                }
+            )
+        return prepared_inputs
 
     @staticmethod
     def _normalize_ingest_mode(ingest_mode: str | None) -> str:
@@ -171,6 +234,38 @@ class LEAFIndexer:
                 return 4
         return 4
 
+    def _migration_prepare_worker_count(self) -> int:
+        raw_value = str(os.environ.get("LEAF_MIGRATION_PREPARE_WORKERS", "")).strip()
+        if raw_value:
+            try:
+                return max(1, int(raw_value))
+            except ValueError:
+                return 16
+        return 16
+
+    def _prepare_worker_count_for_mode(self, ingest_mode: str) -> int:
+        if ingest_mode == INGEST_MODE_MIGRATION:
+            return self._migration_prepare_worker_count()
+        return self._ingest_prepare_worker_count()
+
+    def _embedding_worker_count(self) -> int:
+        raw_value = str(os.environ.get("LEAF_EMBED_WORKERS", "")).strip()
+        if raw_value:
+            try:
+                return max(1, int(raw_value))
+            except ValueError:
+                return 8
+        return 8
+
+    def _embedding_batch_size(self) -> int:
+        raw_value = str(os.environ.get("LEAF_EMBED_BATCH_SIZE", "")).strip()
+        if raw_value:
+            try:
+                return max(1, int(raw_value))
+            except ValueError:
+                return 32
+        return 32
+
     def _prepare_turns_parallel(
         self,
         prepared_inputs: list[dict[str, Any]],
@@ -180,7 +275,9 @@ class LEAFIndexer:
         if not prepared_inputs:
             return []
         if max_workers <= 1 or len(prepared_inputs) == 1:
-            return [self._prepare_single_turn(**payload) for payload in prepared_inputs]
+            prepared_turns = [self._prepare_single_turn(**payload) for payload in prepared_inputs]
+            self._assign_prepared_turn_embeddings(prepared_turns)
+            return prepared_turns
         ordered_results: list[dict[str, Any] | None] = [None] * len(prepared_inputs)
         with ThreadPoolExecutor(max_workers=min(max_workers, len(prepared_inputs))) as executor:
             futures = [
@@ -189,9 +286,53 @@ class LEAFIndexer:
             ]
             for index, future in enumerate(futures):
                 ordered_results[index] = future.result()
-        return [result for result in ordered_results if result is not None]
+        prepared_turns = [result for result in ordered_results if result is not None]
+        self._assign_prepared_turn_embeddings(prepared_turns)
+        return prepared_turns
+
+    @staticmethod
+    def serialize_prepared_turns(prepared_turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        payload: list[dict[str, Any]] = []
+        for prepared_turn in prepared_turns:
+            payload.append(
+                {
+                    "event": prepared_turn["event"].to_dict(),
+                    "atoms": [atom.to_dict() for atom in prepared_turn.get("atoms") or []],
+                    "state_candidates": [
+                        candidate.to_dict() for candidate in prepared_turn.get("state_candidates") or []
+                    ],
+                }
+            )
+        return payload
+
+    @staticmethod
+    def deserialize_prepared_turns(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        prepared_turns: list[dict[str, Any]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            event_payload = item.get("event") or {}
+            if not isinstance(event_payload, dict) or not event_payload:
+                continue
+            prepared_turns.append(
+                {
+                    "event": MemoryEventRecord(**event_payload),
+                    "atoms": [
+                        MemoryAtomRecord(**atom_payload)
+                        for atom_payload in item.get("atoms") or []
+                        if isinstance(atom_payload, dict)
+                    ],
+                    "state_candidates": [
+                        StateCandidate(**candidate_payload)
+                        for candidate_payload in item.get("state_candidates") or []
+                        if isinstance(candidate_payload, dict)
+                    ],
+                }
+            )
+        return prepared_turns
 
     def _apply_prepared_turns(
+
         self,
         prepared_turns: list[dict[str, Any]],
         *,
@@ -318,7 +459,7 @@ class LEAFIndexer:
             entity_refs=list(dict.fromkeys(raw_refs))[:12],
             canonical_entity_refs=canonical_refs[:12],
             metadata=effective_metadata,
-            embedding=self._embed_text(surface),
+            embedding=None,
         )
         extracted_atoms = self.atom_extractor.extract_atoms(span)
         atoms = [
@@ -346,6 +487,7 @@ class LEAFIndexer:
             "event": event,
             "atoms": atoms,
             "state_candidates": self._derive_state_candidates(event=event, atoms=atoms),
+            "embedding_text": surface,
         }
 
     def _apply_prepared_turn(
@@ -660,6 +802,73 @@ class LEAFIndexer:
             return None
         return MemoryObjectVersionRecord(**record.to_dict())
 
+    @staticmethod
+    def _snapshot_embedding_payload(title: str, summary: str) -> str:
+        del title
+        return str(summary or "").strip()
+
+    def _embed_batch(self, texts: list[str]) -> list[list[float] | None]:
+        if not texts:
+            return []
+        if self.embedding_client is None:
+            return [None] * len(texts)
+        try:
+            return self.embedding_client.embed_many(texts)
+        except OpenAICompatError:
+            return [self._embed_text(text) for text in texts]
+
+    def _embed_texts(self, texts: list[str]) -> list[list[float] | None]:
+        if not texts:
+            return []
+        if self.embedding_client is None:
+            return [None] * len(texts)
+        results: list[list[float] | None] = [None] * len(texts)
+        non_empty_positions = [index for index, text in enumerate(texts) if str(text or '').strip()]
+        if not non_empty_positions:
+            return results
+        batch_size = self._embedding_batch_size()
+        batched_positions = [
+            non_empty_positions[start : start + batch_size]
+            for start in range(0, len(non_empty_positions), batch_size)
+        ]
+        if len(batched_positions) == 1 or self._embedding_worker_count() <= 1:
+            for positions in batched_positions:
+                batch_results = self._embed_batch([texts[index] for index in positions])
+                for index, embedding in zip(positions, batch_results):
+                    results[index] = embedding
+            return results
+        with ThreadPoolExecutor(max_workers=min(self._embedding_worker_count(), len(batched_positions))) as executor:
+            future_map = {
+                executor.submit(self._embed_batch, [texts[index] for index in positions]): positions
+                for positions in batched_positions
+            }
+            for future, positions in future_map.items():
+                batch_results = future.result()
+                for index, embedding in zip(positions, batch_results):
+                    results[index] = embedding
+        return results
+
+    def _assign_prepared_turn_embeddings(self, prepared_turns: list[dict[str, Any]]) -> None:
+        if not prepared_turns:
+            return
+        embedding_inputs = [str(item.get("embedding_text") or "").strip() for item in prepared_turns]
+        embeddings = self._embed_texts(embedding_inputs)
+        for prepared_turn, embedding in zip(prepared_turns, embeddings):
+            prepared_turn["event"].embedding = embedding
+            prepared_turn.pop("embedding_text", None)
+
+    def _upsert_snapshots_with_embeddings(self, snapshots: list[MemorySnapshotRecord]) -> None:
+        if not snapshots:
+            return
+        embedding_inputs = [
+            self._snapshot_embedding_payload(snapshot.title, snapshot.summary)
+            for snapshot in snapshots
+        ]
+        embeddings = self._embed_texts(embedding_inputs)
+        for snapshot, embedding in zip(snapshots, embeddings):
+            snapshot.embedding = embedding
+            self.store.upsert_snapshot(snapshot)
+
     def _create_object_and_version(
         self,
         candidate: StateCandidate,
@@ -737,7 +946,7 @@ class LEAFIndexer:
         )
         self.store.add_evidence_link(link)
 
-    def _refresh_session_snapshot(self, corpus_id: str, title: str, session_id: str) -> None:
+    def _build_session_snapshot(self, corpus_id: str, title: str, session_id: str) -> MemorySnapshotRecord:
         events = self.store.get_events(corpus_id=corpus_id, session_id=session_id)
         objects = self.store.get_objects_for_session(corpus_id=corpus_id, session_id=session_id)
         active_summaries: list[str] = []
@@ -754,7 +963,7 @@ class LEAFIndexer:
         synopsis = make_synopsis(active_summaries[:4] + event_texts[:4], max_chars=180)
         refs = merge_memory_refs(active_summaries + event_texts, limit=16)
         child_ids = [event.event_id for event in events[-12:]]
-        snapshot = MemorySnapshotRecord(
+        return MemorySnapshotRecord(
             snapshot_id=stable_id("leaf_snap", corpus_id, "session", session_id),
             corpus_id=corpus_id,
             parent_id=stable_id("leaf_snap", corpus_id, "root"),
@@ -775,11 +984,10 @@ class LEAFIndexer:
                 "num_objects": len(object_ids),
                 "semantic_role": "session_snapshot",
             },
-            embedding=self._embed_text(summary),
+            embedding=None,
         )
-        self.store.upsert_snapshot(snapshot)
 
-    def _refresh_entity_snapshot(self, corpus_id: str, title: str, subject: str) -> None:
+    def _build_entity_snapshot(self, corpus_id: str, title: str, subject: str) -> MemorySnapshotRecord:
         objects = self.store.get_objects_for_subject(corpus_id=corpus_id, subject=subject)
         versions: list[MemoryObjectVersionRecord] = []
         object_ids: list[str] = []
@@ -792,7 +1000,7 @@ class LEAFIndexer:
         summary = summarize_texts(active_versions + event_texts, max_chars=760)
         synopsis = make_synopsis(active_versions[:4] + event_texts[:4], max_chars=180)
         refs = merge_memory_refs([subject] + active_versions + event_texts, limit=16)
-        snapshot = MemorySnapshotRecord(
+        return MemorySnapshotRecord(
             snapshot_id=stable_id("leaf_snap", corpus_id, "entity", subject),
             corpus_id=corpus_id,
             parent_id=stable_id("leaf_snap", corpus_id, "root"),
@@ -813,19 +1021,27 @@ class LEAFIndexer:
                 "num_events": len(recent_events),
                 "semantic_role": "entity_snapshot",
             },
-            embedding=self._embed_text(summary),
+            embedding=None,
         )
-        self.store.upsert_snapshot(snapshot)
 
-    def _refresh_root_snapshot(self, corpus_id: str, title: str) -> None:
-        session_snapshots = self.store.list_snapshots(corpus_id=corpus_id, snapshot_kind="session")
-        entity_snapshots = self.store.list_snapshots(corpus_id=corpus_id, snapshot_kind="entity")
+    def _build_root_snapshot(
+        self,
+        corpus_id: str,
+        title: str,
+        session_snapshots: list[MemorySnapshotRecord] | None = None,
+        entity_snapshots: list[MemorySnapshotRecord] | None = None,
+    ) -> MemorySnapshotRecord:
+        if session_snapshots is None:
+            session_snapshots = self.store.list_snapshots(corpus_id=corpus_id, snapshot_kind="session")
+        if entity_snapshots is None:
+            entity_snapshots = self.store.list_snapshots(corpus_id=corpus_id, snapshot_kind="entity")
         events = self.store.get_events(corpus_id=corpus_id)
         summary_inputs = [snapshot.summary for snapshot in session_snapshots[-6:]] + [snapshot.summary for snapshot in entity_snapshots[:6]]
         if not summary_inputs:
             summary_inputs = [f"{event.speaker}: {event.text}" for event in events[-12:]]
         refs = merge_memory_refs(summary_inputs, limit=20)
-        snapshot = MemorySnapshotRecord(
+        summary = summarize_texts(summary_inputs, max_chars=900)
+        return MemorySnapshotRecord(
             snapshot_id=stable_id("leaf_snap", corpus_id, "root"),
             corpus_id=corpus_id,
             parent_id=None,
@@ -833,7 +1049,7 @@ class LEAFIndexer:
             scope_id=corpus_id,
             title=title,
             synopsis=make_synopsis(summary_inputs[:6], max_chars=220),
-            summary=summarize_texts(summary_inputs, max_chars=900),
+            summary=summary,
             object_ids=[],
             event_ids=[event.event_id for event in events[-24:]],
             raw_refs=[event.raw_span_id for event in events[-24:] if event.raw_span_id],
@@ -847,9 +1063,8 @@ class LEAFIndexer:
                 "num_events": len(events),
                 "semantic_role": "corpus_snapshot",
             },
-            embedding=self._embed_text(title + "\n" + summarize_texts(summary_inputs, max_chars=900)),
+            embedding=None,
         )
-        self.store.upsert_snapshot(snapshot)
 
     def _resolve_subject(self, event: MemoryEventRecord, atom: MemoryAtomRecord) -> str:
         lowered = atom.content.lower().strip()

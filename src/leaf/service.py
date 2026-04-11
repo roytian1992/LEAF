@@ -59,6 +59,63 @@ class LEAFService:
             ingest_mode=ingest_mode,
         )
 
+    def prepare_turns(
+        self,
+        corpus_id: str,
+        turns: list[dict[str, Any]],
+        ingest_mode: str = INGEST_MODE_ONLINE,
+    ) -> list[dict[str, Any]]:
+        return self.indexer.prepare_turns(
+            corpus_id=corpus_id,
+            turns=turns,
+            ingest_mode=ingest_mode,
+        )
+
+    def append_prepared_turns(
+        self,
+        corpus_id: str,
+        title: str,
+        prepared_turns: list[dict[str, Any]],
+        ingest_mode: str = INGEST_MODE_ONLINE,
+    ) -> dict[str, Any]:
+        return self.indexer.append_prepared_turns(
+            corpus_id=corpus_id,
+            title=title,
+            prepared_turns=prepared_turns,
+            ingest_mode=ingest_mode,
+        )
+
+    def save_prepared_turns_cache(
+        self,
+        path: str | Path,
+        *,
+        corpus_id: str,
+        title: str,
+        prepared_turns: list[dict[str, Any]],
+        ingest_mode: str,
+    ) -> None:
+        cache_path = Path(path)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "corpus_id": corpus_id,
+            "title": title,
+            "ingest_mode": ingest_mode,
+            "prepared_turn_count": len(prepared_turns),
+            "prepared_turns": self.indexer.serialize_prepared_turns(prepared_turns),
+        }
+        cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def load_prepared_turns_cache(self, path: str | Path) -> dict[str, Any]:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Prepared cache payload must be a JSON object.")
+        raw_prepared_turns = payload.get("prepared_turns") or []
+        return {
+            **payload,
+            "prepared_turns": self.indexer.deserialize_prepared_turns(raw_prepared_turns),
+        }
+
     def append_turns_online(self, corpus_id: str, title: str, turns: list[dict[str, Any]]) -> dict[str, Any]:
         return self.append_turns(
             corpus_id=corpus_id,
