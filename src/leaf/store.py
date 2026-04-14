@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 from .records import (
     MemoryAtomRecord,
@@ -363,6 +364,22 @@ class SQLiteMemoryStore:
         ).fetchall()
         return [self._row_to_atom(row) for row in rows]
 
+    def get_atoms_for_events(self, event_ids: list[str]) -> list[MemoryAtomRecord]:
+        normalized_ids = [str(event_id).strip() for event_id in event_ids if str(event_id).strip()]
+        if not normalized_ids:
+            return []
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        rows = self.conn.execute(
+            f"""
+            select *
+            from leaf_atoms
+            where event_id in ({placeholders})
+            order by event_id, atom_id
+            """,
+            tuple(normalized_ids),
+        ).fetchall()
+        return [self._row_to_atom(row) for row in rows]
+
     def get_snapshot(self, corpus_id: str, snapshot_kind: str, scope_id: str) -> MemorySnapshotRecord | None:
         row = self.conn.execute(
             """
@@ -486,6 +503,63 @@ class SQLiteMemoryStore:
             """
         ).fetchall()
         return [str(row["corpus_id"]) for row in rows if row["corpus_id"] is not None]
+
+    def get_corpus_stats(self, corpus_id: str) -> dict[str, Any]:
+        def scalar(query: str, *params: object) -> int:
+            row = self.conn.execute(query, params).fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+
+        snapshot_rows = self.conn.execute(
+            """
+            select snapshot_kind, count(*) as count
+            from leaf_snapshots
+            where corpus_id = ?
+            group by snapshot_kind
+            order by snapshot_kind
+            """,
+            (corpus_id,),
+        ).fetchall()
+        snapshot_counts_by_kind = {str(row["snapshot_kind"]): int(row["count"]) for row in snapshot_rows}
+
+        object_rows = self.conn.execute(
+            """
+            select memory_kind, count(*) as count
+            from leaf_objects
+            where corpus_id = ?
+            group by memory_kind
+            order by memory_kind
+            """,
+            (corpus_id,),
+        ).fetchall()
+        object_counts_by_memory_kind = {str(row["memory_kind"]): int(row["count"]) for row in object_rows}
+
+        version_rows = self.conn.execute(
+            """
+            select status, count(*) as count
+            from leaf_object_versions
+            where corpus_id = ?
+            group by status
+            order by status
+            """,
+            (corpus_id,),
+        ).fetchall()
+        version_counts_by_status = {str(row["status"]): int(row["count"]) for row in version_rows}
+
+        db_path = Path(self.db_path)
+        return {
+            "events": scalar("select count(*) from leaf_events where corpus_id = ?", corpus_id),
+            "atoms": scalar("select count(*) from leaf_atoms where corpus_id = ?", corpus_id),
+            "objects": scalar("select count(*) from leaf_objects where corpus_id = ?", corpus_id),
+            "versions": scalar("select count(*) from leaf_object_versions where corpus_id = ?", corpus_id),
+            "evidence_links": scalar("select count(*) from leaf_evidence_links where corpus_id = ?", corpus_id),
+            "snapshots": scalar("select count(*) from leaf_snapshots where corpus_id = ?", corpus_id),
+            "sessions": scalar("select count(distinct session_id) from leaf_events where corpus_id = ?", corpus_id),
+            "subjects": scalar("select count(distinct subject) from leaf_objects where corpus_id = ?", corpus_id),
+            "snapshot_counts_by_kind": snapshot_counts_by_kind,
+            "object_counts_by_memory_kind": object_counts_by_memory_kind,
+            "version_counts_by_status": version_counts_by_status,
+            "db_file_size_bytes": db_path.stat().st_size if db_path.exists() else 0,
+        }
 
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> MemoryEventRecord:

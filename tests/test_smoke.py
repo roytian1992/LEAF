@@ -137,12 +137,18 @@ class LEAFSmokeTest(unittest.TestCase):
                 json.dumps(
                     {
                         "turns": [
-                            {
-                                "session_id": "session-1",
-                                "speaker": "Caroline",
-                                "text": "I have been thinking about studying psychology because I want to work in mental health.",
-                                "timestamp": "2025-01-10T10:00:00",
-                            },
+                            *[
+                                {
+                                    "session_id": "session-1",
+                                    "speaker": "Caroline",
+                                    "text": (
+                                        "I have been thinking about studying psychology because I want to work in mental health. "
+                                        f"This is planning note {index}."
+                                    ),
+                                    "timestamp": f"2025-01-{10 + index:02d}T10:00:00",
+                                }
+                                for index in range(7)
+                            ],
                             {
                                 "session_id": "session-2",
                                 "speaker": "Caroline",
@@ -163,7 +169,7 @@ class LEAFSmokeTest(unittest.TestCase):
                     title="Smoke Demo",
                     path=input_path,
                 )
-                self.assertEqual(ingest["events_written"], 2)
+                self.assertEqual(ingest["events_written"], 8)
                 self.assertIn("caroline", ingest["touched_subjects"])
 
                 corpora = service.list_corpora()
@@ -173,6 +179,18 @@ class LEAFSmokeTest(unittest.TestCase):
                 self.assertIsNotNone(root)
                 self.assertEqual(root["snapshot_kind"], "root")
 
+                session = service.get_session_snapshot("demo", "session-1")
+                self.assertIsNotNone(session)
+                self.assertTrue(session["child_ids"])
+                session_block_ids = session["child_ids"]
+                for block_id in session_block_ids:
+                    block = service.store.conn.execute(
+                        "select snapshot_kind from leaf_snapshots where snapshot_id = ?",
+                        (block_id,),
+                    ).fetchone()
+                    self.assertIsNotNone(block)
+                    self.assertEqual(block["snapshot_kind"], "session_block")
+
                 retrieval = service.search(
                     corpus_id="demo",
                     question="What is Caroline planning to study?",
@@ -181,6 +199,10 @@ class LEAFSmokeTest(unittest.TestCase):
                 self.assertTrue(retrieval["pages"])
                 self.assertTrue(retrieval["raw_spans"])
                 self.assertIn("timing", retrieval)
+                self.assertTrue(
+                    any(page["page_kind"] == "session_block" for page in retrieval["pages"]),
+                    msg=f"Expected session_block in retrieval pages, got {retrieval['pages']}",
+                )
             finally:
                 service.close()
 

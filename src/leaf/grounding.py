@@ -59,6 +59,8 @@ def parse_anchor_datetime(timestamp: str | None) -> datetime | None:
         "%d %B, %Y",
         "%d %B %Y",
         "%B %d, %Y",
+        "%Y-%m-%d",
+        "%Y/%m/%d",
     ]
     for pattern in patterns:
         try:
@@ -180,3 +182,156 @@ def query_tokens(query: str) -> set[str]:
         for token in re.sub(r"[^a-z0-9\s]", " ", query.lower()).split()
         if len(token) > 2
     }
+
+
+TEXT_FRAGMENT_MAX_UNITS = 400
+TEXT_FRAGMENT_OVERLAP_UNITS = 40
+_CJK_CHAR_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_LATIN_WORD_RE = re.compile(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*")
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[\.\!\?。！？])\s+|\n+")
+_CLAUSE_BOUNDARY_RE = re.compile(r"(?<=[,;:，；：、])\s*")
+
+
+def text_unit_count(text: str) -> int:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return 0
+    cjk_count = len(_CJK_CHAR_RE.findall(stripped))
+    latin_count = len(_LATIN_WORD_RE.findall(stripped))
+    return cjk_count + latin_count
+
+
+def _split_with_pattern(text: str, pattern: re.Pattern[str]) -> list[str]:
+    pieces = [part.strip() for part in pattern.split(str(text or "").strip()) if part and part.strip()]
+    return pieces
+
+
+def _split_oversized_piece(text: str, max_units: int) -> list[str]:
+    clauses = _split_with_pattern(text, _CLAUSE_BOUNDARY_RE)
+    if len(clauses) > 1:
+        return _pack_units(clauses, max_units=max_units)
+    words = str(text or "").split()
+    if len(words) > 1:
+        chunks: list[str] = []
+        current: list[str] = []
+        current_units = 0
+        for word in words:
+            units = max(1, text_unit_count(word))
+            if current and current_units + units > max_units:
+                chunks.append(" ".join(current).strip())
+                current = [word]
+                current_units = units
+            else:
+                current.append(word)
+                current_units += units
+        if current:
+            chunks.append(" ".join(current).strip())
+        return [chunk for chunk in chunks if chunk]
+    raw = str(text or "").strip()
+    if text_unit_count(raw) <= max_units:
+        return [raw]
+    chars = list(raw)
+    chunks = []
+    start = 0
+    while start < len(chars):
+        end = min(len(chars), start + max_units)
+        chunks.append("".join(chars[start:end]).strip())
+        start = end
+    return [chunk for chunk in chunks if chunk]
+
+
+def _pack_units(parts: list[str], max_units: int) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    current_units = 0
+    for part in parts:
+        units = text_unit_count(part)
+        if units > max_units:
+            oversized = _split_oversized_piece(part, max_units=max_units)
+            if current:
+                chunks.append(" ".join(current).strip())
+                current = []
+                current_units = 0
+            chunks.extend(oversized)
+            continue
+        if current and current_units + units > max_units:
+            chunks.append(" ".join(current).strip())
+            current = [part]
+            current_units = units
+        else:
+            current.append(part)
+            current_units += units
+    if current:
+        chunks.append(" ".join(current).strip())
+    return [chunk for chunk in chunks if chunk]
+
+
+def _tail_overlap_segments(text: str, overlap_units: int) -> list[str]:
+    segments = _split_with_pattern(text, _SENTENCE_BOUNDARY_RE)
+    if not segments:
+        return []
+    selected: list[str] = []
+    total_units = 0
+    for segment in reversed(segments):
+        seg_units = text_unit_count(segment)
+        if selected and total_units + seg_units > overlap_units:
+            break
+        selected.insert(0, segment)
+        total_units += seg_units
+        if total_units >= overlap_units:
+            break
+    return selected
+
+
+def _rebalance_chunks(chunks: list[str], max_units: int) -> list[str]:
+    if len(chunks) < 2:
+        return chunks
+    balanced = list(chunks)
+    while len(balanced) >= 2:
+        tail_units = text_unit_count(balanced[-1])
+        if tail_units >= int(max_units * 0.35):
+            break
+        prev_segments = _split_with_pattern(balanced[-2], _SENTENCE_BOUNDARY_RE)
+        if len(prev_segments) <= 1:
+            break
+        moved = prev_segments.pop()
+        candidate_tail = f"{moved} {balanced[-1]}".strip()
+        if text_unit_count(candidate_tail) > max_units:
+            break
+        balanced[-2] = " ".join(prev_segments).strip()
+        balanced[-1] = candidate_tail
+        if not balanced[-2]:
+            balanced.pop(-2)
+            break
+    return [chunk for chunk in balanced if chunk]
+
+
+def split_text_fragments(
+    text: str,
+    *,
+    max_units: int = TEXT_FRAGMENT_MAX_UNITS,
+    overlap_units: int = TEXT_FRAGMENT_OVERLAP_UNITS,
+) -> list[str]:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return []
+    if text_unit_count(stripped) <= max_units:
+        return [stripped]
+
+    sentence_parts = _split_with_pattern(stripped, _SENTENCE_BOUNDARY_RE)
+    if not sentence_parts:
+        sentence_parts = [stripped]
+    chunks = _pack_units(sentence_parts, max_units=max_units)
+    chunks = _rebalance_chunks(chunks, max_units=max_units)
+    if len(chunks) <= 1:
+        return chunks
+
+    overlapped: list[str] = [chunks[0]]
+    for chunk in chunks[1:]:
+        overlap_segments = _tail_overlap_segments(overlapped[-1], overlap_units=overlap_units)
+        prefix = " ".join(overlap_segments).strip()
+        candidate = f"{prefix} {chunk}".strip() if prefix else chunk
+        if prefix and text_unit_count(candidate) > max_units:
+            candidate = chunk
+        overlapped.append(candidate)
+    return overlapped

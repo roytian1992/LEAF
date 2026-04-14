@@ -42,7 +42,13 @@ class LEAFService:
     def append_turns(self, corpus_id: str, title: str, turns: list[dict[str, Any]]) -> dict[str, Any]:
         return self.indexer.append_turns(corpus_id=corpus_id, title=title, turns=turns)
 
-    def search(self, corpus_id: str, question: str, raw_span_limit: int = 8) -> dict[str, Any]:
+    def search(
+        self,
+        corpus_id: str,
+        question: str,
+        snapshot_limit: int = 6,
+        raw_span_limit: int = 8,
+    ) -> dict[str, Any]:
         if self.embedding is None:
             raise RuntimeError("Embedding model is not configured.")
         return retrieve_leaf_memory(
@@ -50,6 +56,7 @@ class LEAFService:
             corpus_id=corpus_id,
             question=question,
             embedding=self.embedding,
+            snapshot_limit=snapshot_limit,
             raw_span_limit=raw_span_limit,
         )
 
@@ -131,5 +138,4 @@ class LEAFService:
             if isinstance(payload.get("messages"), list):
                 return [item for item in payload["messages"] if isinstance(item, dict)]
         raise ValueError("Unsupported conversation JSON format")
-
 
