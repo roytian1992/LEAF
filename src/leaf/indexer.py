@@ -10,6 +10,7 @@ from typing import Any
 from .clients import ChatClient, EmbeddingClient, OpenAICompatError, extract_json_object
 from .extract import (
     AtomExtractor,
+    build_text_tags,
     canonicalize_entities,
     extract_entities,
     extract_semantic_references,
@@ -36,6 +37,9 @@ AMBIGUOUS_ACTIONS = {"PATCH", "SUPERSEDE", "TENTATIVE"}
 SESSION_PAGE_SIZE = 8
 SESSION_BLOCK_LEAF_EVENTS = 6
 SESSION_BLOCK_TOP_EVENTS = 24
+MERGED_ATOM_MAX_UNITS = 220
+MERGED_ATOM_MIN_TURNS = 2
+MERGED_ATOM_MAX_TURNS = 6
 
 
 def _normalize_value(text: str) -> str:
@@ -123,6 +127,8 @@ class LEAFIndexer:
                 )
             prepare_worker_count = self._ingest_prepare_worker_count()
             prepared_turns = self._prepare_turns_parallel(prepared_inputs, max_workers=prepare_worker_count)
+            prepared_turns = self._attach_chunk_extractions(prepared_turns)
+            extraction_chunk_count = sum(1 for prepared_turn in prepared_turns if prepared_turn.get("atoms"))
             for prepared_turn in prepared_turns:
                 event, atoms, touched_object_count, state_subjects, turn_metrics = self._apply_prepared_turn(
                     prepared_turn
@@ -168,14 +174,15 @@ class LEAFIndexer:
             "evidence_links_written": evidence_links_written,
             "state_candidates": state_candidates,
             "state_action_counts": dict(sorted(state_action_counts.items())),
-            "memory_llm_calls_est": {
-                "atom_extraction": events_written if self.atom_extractor.llm is not None else 0,
+                "memory_llm_calls_est": {
+                "atom_extraction": extraction_chunk_count if self.atom_extractor.llm is not None else 0,
                 "reconciliation": int(runtime_metrics.get("reconcile_llm_calls", 0)),
                 "total": (
-                    (events_written if self.atom_extractor.llm is not None else 0)
+                    (extraction_chunk_count if self.atom_extractor.llm is not None else 0)
                     + int(runtime_metrics.get("reconcile_llm_calls", 0))
                 ),
             },
+            "extraction_chunk_count": extraction_chunk_count,
             "snapshot_upserts_by_kind": dict(sorted(snapshot_upserts_by_kind.items())),
             "snapshot_upserts_total": int(sum(snapshot_upserts_by_kind.values())),
             "touched_sessions": sorted(touched_sessions),
@@ -257,34 +264,68 @@ class LEAFIndexer:
             metadata=effective_metadata,
             embedding=self._embed_text(surface),
         )
-        extracted_atoms = self.atom_extractor.extract_atoms(span)
-        atoms = [
-            MemoryAtomRecord(
-                atom_id=atom.atom_id,
-                event_id=event.event_id,
-                corpus_id=atom.corpus_id,
-                span_id=atom.span_id,
-                atom_type=atom.atom_type,
-                content=atom.content,
-                entities=atom.entities,
-                canonical_entities=atom.canonical_entities,
-                support_span_ids=atom.support_span_ids,
-                derived_from_atom_ids=atom.derived_from_atom_ids,
-                memory_kind=atom.memory_kind,
-                status=atom.status,
-                time_range=atom.time_range,
-                confidence=atom.confidence,
-                metadata=atom.metadata,
-            )
-            for atom in extracted_atoms
-        ]
-        event.atom_ids = [atom.atom_id for atom in atoms]
-        state_candidates = self._derive_state_candidates(event=event, atoms=atoms)
         return {
             "event": event,
-            "atoms": atoms,
-            "state_candidates": state_candidates,
+            "span": span,
+            "atoms": [],
+            "state_candidates": [],
         }
+
+    def _attach_chunk_extractions(self, prepared_turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not prepared_turns:
+            return prepared_turns
+        grouped_by_session: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        session_order: list[str] = []
+        for prepared_turn in prepared_turns:
+            session_id = str(prepared_turn["event"].session_id)
+            if session_id not in grouped_by_session:
+                session_order.append(session_id)
+            grouped_by_session[session_id].append(prepared_turn)
+            prepared_turn["atoms"] = []
+            prepared_turn["state_candidates"] = []
+        for session_id in session_order:
+            session_turns = grouped_by_session[session_id]
+            chunks = self._build_extraction_chunks(session_turns)
+            previous_chunk: list[dict[str, Any]] | None = None
+            for chunk in chunks:
+                anchor_turn = chunk[-1]
+                anchor_event = anchor_turn["event"]
+                extraction_span = self._build_chunk_extraction_span(chunk, previous_chunk)
+                extracted_atoms = self.atom_extractor.extract_atoms(extraction_span)
+                support_span_ids = [str(item["span"].span_id) for item in chunk if item.get("span") is not None]
+                anchor_span_id = str(anchor_turn["span"].span_id)
+                atoms = [
+                    MemoryAtomRecord(
+                        atom_id=atom.atom_id,
+                        event_id=anchor_event.event_id,
+                        corpus_id=atom.corpus_id,
+                        span_id=anchor_span_id,
+                        atom_type=atom.atom_type,
+                        content=atom.content,
+                        entities=atom.entities,
+                        canonical_entities=atom.canonical_entities,
+                        support_span_ids=support_span_ids,
+                        derived_from_atom_ids=atom.derived_from_atom_ids,
+                        memory_kind=atom.memory_kind,
+                        status=atom.status,
+                        time_range=atom.time_range,
+                        confidence=atom.confidence,
+                        metadata={
+                            **dict(atom.metadata or {}),
+                            "source_speaker": anchor_event.speaker,
+                            "merged_chunk_span_id": extraction_span.span_id,
+                            "merged_turn_count": len(chunk),
+                            "support_span_ids": support_span_ids,
+                            "merged_turn_indexes": [int(item["event"].turn_index) for item in chunk],
+                            "chunk_session_id": anchor_event.session_id,
+                        },
+                    )
+                    for atom in extracted_atoms
+                ]
+                anchor_turn["atoms"] = atoms
+                anchor_turn["state_candidates"] = self._derive_state_candidates(event=anchor_event, atoms=atoms)
+                previous_chunk = chunk
+        return prepared_turns
 
     def _apply_prepared_turn(
         self,
@@ -293,6 +334,7 @@ class LEAFIndexer:
         event = prepared_turn["event"]
         atoms = list(prepared_turn.get("atoms") or [])
         state_candidates = list(prepared_turn.get("state_candidates") or [])
+        event.atom_ids = [atom.atom_id for atom in atoms]
         self.store.add_event(event)
         for atom in atoms:
             self.store.add_atom(atom)
@@ -375,10 +417,124 @@ class LEAFIndexer:
             "evidence_links_written": evidence_links_written,
         }
 
-    def _embed_snapshot(self, title: str, summary: str) -> list[float] | None:
+    def _embed_snapshot(self, title: str, summary: str, tags: list[str] | None = None) -> list[float] | None:
         parts = [str(title or "").strip(), str(summary or "").strip()]
+        if tags:
+            parts.append("Tags: " + ", ".join(str(tag).strip() for tag in tags if str(tag).strip()))
         payload = "\n".join(part for part in parts if part)
         return self._embed_text(payload)
+
+    @staticmethod
+    def _text_unit_count(text: str) -> int:
+        lowered = str(text or "").strip()
+        if not lowered:
+            return 0
+        return len(re.findall(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*|[\u3400-\u9fff]", lowered))
+
+    @staticmethod
+    def _turn_signal_terms(prepared_turn: dict[str, Any]) -> set[str]:
+        event = prepared_turn["event"]
+        metadata = dict(event.metadata or {})
+        refs = [str(item).strip().lower() for item in (event.canonical_entity_refs or []) if str(item).strip()]
+        refs.extend(str(item).strip().lower() for item in (metadata.get("semantic_refs") or []) if str(item).strip())
+        return set(refs)
+
+    def _should_merge_turn(self, chunk: list[dict[str, Any]], next_turn: dict[str, Any], chunk_units: int) -> bool:
+        if not chunk:
+            return True
+        next_units = self._text_unit_count(next_turn["event"].text)
+        if len(chunk) >= MERGED_ATOM_MAX_TURNS:
+            return False
+        if chunk_units + next_units > MERGED_ATOM_MAX_UNITS:
+            return False
+        if len(chunk) < MERGED_ATOM_MIN_TURNS:
+            return True
+        last_turn = chunk[-1]
+        last_event = last_turn["event"]
+        next_event = next_turn["event"]
+        overlap = self._turn_signal_terms(last_turn).intersection(self._turn_signal_terms(next_turn))
+        if overlap:
+            return True
+        if str(last_event.speaker) == str(next_event.speaker):
+            return True
+        if next_units <= 36:
+            return True
+        if chunk_units <= 120:
+            return True
+        return False
+
+    def _build_extraction_chunks(self, session_turns: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        if not session_turns:
+            return []
+        chunks: list[list[dict[str, Any]]] = []
+        current_chunk: list[dict[str, Any]] = []
+        current_units = 0
+        for prepared_turn in session_turns:
+            turn_units = self._text_unit_count(prepared_turn["event"].text)
+            if current_chunk and not self._should_merge_turn(current_chunk, prepared_turn, current_units):
+                chunks.append(current_chunk)
+                current_chunk = []
+                current_units = 0
+            current_chunk.append(prepared_turn)
+            current_units += turn_units
+        if current_chunk:
+            chunks.append(current_chunk)
+        return chunks
+
+    @staticmethod
+    def _last_sentence(text: str) -> str:
+        stripped = str(text or "").strip()
+        if not stripped:
+            return ""
+        pieces = [piece.strip() for piece in re.split(r"(?<=[\.\!\?。！？])\s+|\n+", stripped) if piece.strip()]
+        return pieces[-1] if pieces else stripped
+
+    def _build_chunk_extraction_span(
+        self,
+        chunk: list[dict[str, Any]],
+        previous_chunk: list[dict[str, Any]] | None,
+    ) -> RawSpan:
+        anchor_turn = chunk[-1]
+        anchor_event = anchor_turn["event"]
+        support_span_ids = [str(item["span"].span_id) for item in chunk if item.get("span") is not None]
+        overlap_sentence = ""
+        if previous_chunk:
+            overlap_sentence = self._last_sentence(previous_chunk[-1]["event"].text)
+        lines: list[str] = []
+        if overlap_sentence:
+            lines.append(f"Context overlap: {overlap_sentence}")
+        for prepared_turn in chunk:
+            event = prepared_turn["event"]
+            lines.append(f"{event.speaker}: {event.text}")
+        merged_text = "\n".join(line for line in lines if line.strip())
+        semantic_refs = merge_memory_refs([prepared_turn["event"].text for prepared_turn in chunk], limit=16)
+        metadata = {
+            "source": "merged_chunk",
+            "support_span_ids": support_span_ids,
+            "source_speakers": list(dict.fromkeys(str(item["event"].speaker) for item in chunk)),
+            "merged_turn_count": len(chunk),
+            "merged_turn_indexes": [int(item["event"].turn_index) for item in chunk],
+            "semantic_refs": semantic_refs,
+        }
+        if overlap_sentence:
+            metadata["overlap_sentence"] = overlap_sentence
+        return RawSpan(
+            span_id=stable_id(
+                "leaf_chunk",
+                anchor_event.corpus_id,
+                anchor_event.session_id,
+                str(chunk[0]["event"].turn_index),
+                str(chunk[-1]["event"].turn_index),
+            ),
+            corpus_id=anchor_event.corpus_id,
+            session_id=anchor_event.session_id,
+            speaker=anchor_event.speaker,
+            text=merged_text,
+            turn_index=anchor_event.turn_index,
+            timestamp=anchor_event.timestamp,
+            metadata=metadata,
+            embedding=None,
+        )
 
     @staticmethod
     def _estimate_text_tokens(text: str) -> int:
@@ -574,6 +730,7 @@ class LEAFIndexer:
         summary = summarize_texts(active_summaries + event_texts, max_chars=760)
         synopsis = make_synopsis(active_summaries[:4] + event_texts[:4], max_chars=180)
         refs = merge_memory_refs(active_summaries + event_texts, limit=16)
+        tags = build_text_tags(active_summaries + event_texts, max_tags=5)
         snapshot = MemorySnapshotRecord(
             snapshot_id=session_snapshot_id,
             corpus_id=corpus_id,
@@ -595,8 +752,9 @@ class LEAFIndexer:
                 "num_objects": len(object_ids),
                 "num_blocks": len(session_blocks),
                 "semantic_role": "session_snapshot",
+                "tags": tags,
             },
-            embedding=self._embed_snapshot(f"{title}:{session_id}", summary),
+            embedding=self._embed_snapshot(f"{title}:{session_id}", summary, tags),
         )
         self.store.upsert_snapshot(snapshot)
         return {"session": 1, "session_block": block_count}
@@ -646,6 +804,7 @@ class LEAFIndexer:
             refs = merge_memory_refs(chunk_texts, limit=12)
             page_title = f"{title}:{session_id}:page-{page_index}"
             page_summary = summarize_texts(chunk_texts, max_chars=480)
+            tags = build_text_tags(chunk_texts, max_tags=5)
             page = MemorySnapshotRecord(
                 snapshot_id=stable_id("leaf_snap", corpus_id, "session_page", session_id, str(page_index)),
                 corpus_id=corpus_id,
@@ -670,8 +829,9 @@ class LEAFIndexer:
                     "start_turn_index": chunk[0].turn_index,
                     "end_turn_index": chunk[-1].turn_index,
                     "num_events": len(chunk),
+                    "tags": tags,
                 },
-                embedding=self._embed_snapshot(page_title, page_summary),
+                embedding=self._embed_snapshot(page_title, page_summary, tags),
             )
             self.store.upsert_snapshot(page)
             pages.append(page)
@@ -735,6 +895,7 @@ class LEAFIndexer:
 
         summary = summarize_texts(summary_inputs, max_chars=480 if is_leaf else 560)
         synopsis = make_synopsis(synopsis_inputs[:4], max_chars=160)
+        tags = build_text_tags(summary_inputs, max_tags=5)
         block = MemorySnapshotRecord(
             snapshot_id=snapshot_id,
             corpus_id=corpus_id,
@@ -761,8 +922,9 @@ class LEAFIndexer:
                 "end_turn_index": end_turn_index,
                 "num_events": len(events),
                 "num_children": len(child_blocks),
+                "tags": tags,
             },
-            embedding=self._embed_snapshot(f"{title}:{session_id}:block-{branch_label}", summary),
+            embedding=self._embed_snapshot(f"{title}:{session_id}:block-{branch_label}", summary, tags),
         )
         self.store.upsert_snapshot(block)
         return block, 1 + child_block_count
@@ -793,6 +955,7 @@ class LEAFIndexer:
         summary = summarize_texts(active_versions + event_texts, max_chars=760)
         synopsis = make_synopsis(active_versions[:4] + event_texts[:4], max_chars=180)
         refs = merge_memory_refs([subject] + active_versions + event_texts, limit=16)
+        tags = build_text_tags([subject] + active_versions + event_texts, max_tags=5)
         snapshot = MemorySnapshotRecord(
             snapshot_id=stable_id("leaf_snap", corpus_id, "entity", subject),
             corpus_id=corpus_id,
@@ -813,8 +976,9 @@ class LEAFIndexer:
                 "num_objects": len(object_ids),
                 "num_events": len(recent_events),
                 "semantic_role": "entity_snapshot",
+                "tags": tags,
             },
-            embedding=self._embed_snapshot(f"{title}:{subject}", summary),
+            embedding=self._embed_snapshot(f"{title}:{subject}", summary, tags),
         )
         self.store.upsert_snapshot(snapshot)
         return {"entity": 1}
@@ -828,6 +992,7 @@ class LEAFIndexer:
             summary_inputs = [f"{event.speaker}: {event.text}" for event in events[-12:]]
         refs = merge_memory_refs(summary_inputs, limit=20)
         root_summary = summarize_texts(summary_inputs, max_chars=900)
+        tags = build_text_tags(summary_inputs, max_tags=5)
         snapshot = MemorySnapshotRecord(
             snapshot_id=stable_id("leaf_snap", corpus_id, "root"),
             corpus_id=corpus_id,
@@ -849,8 +1014,9 @@ class LEAFIndexer:
                 "num_entities": len(entity_snapshots),
                 "num_events": len(events),
                 "semantic_role": "corpus_snapshot",
+                "tags": tags,
             },
-            embedding=self._embed_snapshot(title, root_summary),
+            embedding=self._embed_snapshot(title, root_summary, tags),
         )
         self.store.upsert_snapshot(snapshot)
         return {"root": 1}
@@ -863,7 +1029,8 @@ class LEAFIndexer:
             or lowered.startswith("my ")
             or re.search(r"\b(i|my|me|i'm)\b", lowered) is not None
         ):
-            canonical_speaker = canonicalize_entities([event.speaker], limit=1)
+            source_speaker = str(atom.metadata.get("source_speaker") or event.speaker)
+            canonical_speaker = canonicalize_entities([source_speaker], limit=1)
             return canonical_speaker[0] if canonical_speaker else event.speaker
         if atom.canonical_entities:
             return atom.canonical_entities[0]

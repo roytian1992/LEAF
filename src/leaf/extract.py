@@ -5,6 +5,7 @@ import importlib
 import os
 import re
 from collections import Counter
+from functools import lru_cache
 
 from .normalize import EntityResolver, canonicalize_entity
 from .clients import ChatClient, OpenAICompatError, extract_json_object
@@ -70,6 +71,9 @@ SPACY_ENTITY_LABELS = {"PERSON", "ORG", "GPE", "LOC", "FAC", "EVENT", "WORK_OF_A
 _SPACY_NLP = None
 _SPACY_INIT_ATTEMPTED = False
 _NLTK_READY = None
+_YAKE_KEYWORD_EXTRACTOR = None
+_YAKE_INIT_ATTEMPTED = False
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[\.\!\?。！？])\s+|\n+")
 
 
 def _env_enabled(*names: str) -> bool:
@@ -122,6 +126,31 @@ def _get_spacy_nlp():
             except Exception:
                 continue
     return None
+
+
+def _get_yake_extractor():
+    global _YAKE_KEYWORD_EXTRACTOR, _YAKE_INIT_ATTEMPTED
+    if _YAKE_INIT_ATTEMPTED:
+        return _YAKE_KEYWORD_EXTRACTOR
+    _YAKE_INIT_ATTEMPTED = True
+    if _env_enabled("LEAF_DISABLE_YAKE"):
+        return None
+    try:
+        import yake
+    except ImportError:
+        return None
+    try:
+        _YAKE_KEYWORD_EXTRACTOR = yake.KeywordExtractor(
+            lan="en",
+            n=2,
+            dedupLim=0.85,
+            dedupFunc="seqm",
+            windowsSize=1,
+            top=12,
+        )
+    except Exception:
+        _YAKE_KEYWORD_EXTRACTOR = None
+    return _YAKE_KEYWORD_EXTRACTOR
 
 
 def _spacy_entity_candidates(text: str) -> list[str]:
@@ -323,12 +352,121 @@ def infer_atom_status(content: str) -> str:
     return "active"
 
 
+def _truncate_text(text: str, max_chars: int) -> str:
+    stripped = re.sub(r"\s+", " ", str(text or "").strip())
+    if len(stripped) <= max_chars:
+        return stripped
+    return stripped[: max_chars - 3].rstrip() + "..."
+
+
+def _split_sentences(texts: list[str]) -> list[str]:
+    sentences: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        for sentence in _SENTENCE_SPLIT_RE.split(str(text or "").strip()):
+            clean = re.sub(r"\s+", " ", sentence).strip()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            sentences.append(clean)
+    return sentences
+
+
+def _normalize_tag(text: str) -> str:
+    lowered = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    lowered = re.sub(r"^[^a-z0-9\u3400-\u9fff]+|[^a-z0-9\u3400-\u9fff]+$", "", lowered)
+    if not lowered:
+        return ""
+    tokens = [token for token in re.split(r"[^a-z0-9\u3400-\u9fff]+", lowered) if token]
+    if not tokens:
+        return ""
+    if all(token in STOPWORDS or token in ENTITY_NOISE_WORDS for token in tokens):
+        return ""
+    return lowered
+
+
+@lru_cache(maxsize=4096)
+def _score_tag_phrase(tag: str) -> tuple[int, int]:
+    tokens = [token for token in re.split(r"[^a-z0-9\u3400-\u9fff]+", tag) if token]
+    return (len(tokens), len(tag))
+
+
+def build_text_tags(texts: list[str], max_tags: int = 5) -> list[str]:
+    merged = re.sub(r"\s+", " ", " ".join(str(text or "").strip() for text in texts if str(text or "").strip())).strip()
+    if not merged:
+        return []
+    candidates: list[str] = []
+    extractor = _get_yake_extractor()
+    if extractor is not None:
+        try:
+            for keyword, _score in extractor.extract_keywords(merged):
+                normalized = _normalize_tag(keyword)
+                if normalized:
+                    candidates.append(normalized)
+        except Exception:
+            pass
+    candidates.extend(_normalize_tag(entity) for entity in extract_entities(merged))
+    candidates.extend(_normalize_tag(ref) for ref in extract_semantic_references(merged))
+    counts = Counter()
+    ordered: list[str] = []
+    for candidate in candidates:
+        clean = str(candidate or "").strip()
+        if not clean:
+            continue
+        counts[clean] += 1
+        if clean not in ordered:
+            ordered.append(clean)
+    ranked = sorted(
+        ordered,
+        key=lambda item: (
+            -counts[item],
+            -_score_tag_phrase(item)[0],
+            -_score_tag_phrase(item)[1],
+            item,
+        ),
+    )
+    return ranked[:max_tags]
+
+
 def summarize_texts(texts: list[str], max_chars: int = 480) -> str:
     merged = " ".join(item.strip() for item in texts if item.strip())
     merged = re.sub(r"\s+", " ", merged).strip()
     if len(merged) <= max_chars:
         return merged
-    return merged[: max_chars - 3].rstrip() + "..."
+    sentences = _split_sentences(texts)
+    if not sentences:
+        return _truncate_text(merged, max_chars=max_chars)
+    tags = build_text_tags(texts, max_tags=6)
+    scored_sentences: list[tuple[float, int, str]] = []
+    for index, sentence in enumerate(sentences):
+        lowered = sentence.lower()
+        score = max(0.0, 1.4 - 0.08 * index)
+        for tag in tags:
+            if tag and tag in lowered:
+                score += 1.1
+        sentence_entities = extract_entities(sentence)
+        score += min(1.2, 0.18 * len(sentence_entities))
+        sentence_refs = extract_semantic_references(sentence)
+        score += min(0.8, 0.2 * len(sentence_refs))
+        if len(sentence) <= max_chars * 0.7:
+            score += 0.25
+        scored_sentences.append((score, index, sentence))
+    chosen: list[tuple[int, str]] = []
+    char_count = 0
+    for _score, index, sentence in sorted(scored_sentences, key=lambda item: (-item[0], item[1])):
+        extra = len(sentence) + (1 if chosen else 0)
+        if chosen and char_count + extra > max_chars:
+            continue
+        if not chosen and len(sentence) > max_chars:
+            return _truncate_text(sentence, max_chars=max_chars)
+        chosen.append((index, sentence))
+        char_count += extra
+        if char_count >= max_chars * 0.82:
+            break
+    if not chosen:
+        return _truncate_text(merged, max_chars=max_chars)
+    chosen.sort(key=lambda item: item[0])
+    return _truncate_text(" ".join(sentence for _, sentence in chosen), max_chars=max_chars)
 
 
 def make_synopsis(texts: list[str], max_chars: int = 180) -> str:

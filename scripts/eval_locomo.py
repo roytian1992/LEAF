@@ -500,31 +500,33 @@ def build_answer_messages(
 ) -> list[dict[str, str]]:
     context_lines = context_lines if context_lines is not None else build_answer_context_lines(evidence)
     inference_mode = is_inference_query(question)
-    context = answer_view_text if answer_view_text is not None else "\n".join(context_lines).strip()
-    context = context.strip() or "(no retrieved evidence)"
+    system_prompt = (
+        "You are an intelligent memory assistant tasked with answering questions from conversation memories. "
+        "Use only the provided evidence. Carefully analyze the evidence, pay attention to timestamps, and prefer direct evidence when available. "
+        "If multiple memories conflict, prioritize the most recent well-supported memory. "
+        "Always convert relative time references into specific dates, months, or years when the evidence allows. "
+        "Focus only on the people and facts actually supported by the memories. "
+        "The final answer should be a precise, concise phrase, usually under 5 to 6 words. "
+        "Do not output UNKNOWN, insufficient information, or similar abstentions. "
+        "Instead, provide the single best-supported answer implied by the evidence."
+    )
     if inference_mode:
-        system_prompt = (
-            "Answer the question using only the provided evidence. "
-            "The evidence is organized into sectioned text lists such as Direct Evidence, Facts, Timeline, Relations, Context, and Insufficient. "
-            "You may make a grounded inference when the answer is implied by multiple clues across these sections even if no raw snippet states it verbatim. "
-            "Prefer the best-supported concise inference over UNKNOWN. "
-            "Use brief noun phrases or short clauses, not full explanations. "
-            "If the evidence truly does not support a plausible answer, answer UNKNOWN. "
-            "Return only the answer phrase."
+        system_prompt += (
+            " You may make a grounded inference when the answer is implied by multiple clues, "
+            "but stay close to the evidence and return only the best-supported answer phrase."
         )
     else:
-        system_prompt = (
-            "Answer the question using only the provided evidence. "
-            "The evidence is organized into sectioned text lists such as Direct Evidence, Facts, Timeline, Relations, Context, and Insufficient. "
-            "Treat direct_evidence and raw_evidence as the strongest grounded snippets, entity_facts and facts as distilled memory statements, temporal_clues as time anchors, relation_paths and relations as graph hints, and page_context or page_summaries as high-level context. "
-            "Prefer direct_evidence or raw_evidence when they directly answer the question, otherwise combine distilled facts with temporal clues, relation paths, and page context. "
-            "If the evidence is insufficient, answer UNKNOWN. "
-            "Resolve relative time references into absolute dates or times when the evidence allows. "
-            "For list, set, or comparison questions, include every supported item once, comma-separated. "
-            "Use the most specific short labels supported by the evidence, not a full sentence. "
-            "Do not repeat the subject names from the question. "
-            "For how, method, or activity questions, return only the activity phrase such as 'dancing' or 'by dancing'. "
-            "Return only the shortest answer phrase, with no explanation or preamble."
+        system_prompt += (
+            " Use the most specific short label supported by the evidence. "
+            "For list or set questions, include every supported item once, comma-separated. "
+            "For how, method, or activity questions, return only the activity phrase."
+        )
+    user_content = (answer_view_text or "").strip()
+    if not user_content:
+        context = "\n".join(context_lines).strip() or "(no retrieved evidence)"
+        user_content = (
+            f"Question: {question}\n\n"
+            f"Evidence:\n{context}"
         )
     return [
         {
@@ -533,11 +535,7 @@ def build_answer_messages(
         },
         {
             "role": "user",
-            "content": (
-                f"Question: {question}\n\n"
-                f"Retrieved memory evidence:\n{context}\n\n"
-                "Return only the answer text."
-            ),
+            "content": user_content,
         },
     ]
 
@@ -702,6 +700,135 @@ def summarize_category(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def build_summary(
+    *,
+    samples: list[dict[str, Any]],
+    ingest_rows: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+    judge_with_llm: bool,
+    judge_runs: int,
+) -> dict[str, Any]:
+    categories: dict[str, list[dict[str, Any]]] = {}
+    for row in results:
+        categories.setdefault(str(row["category_name"]), []).append(row)
+
+    token_values = [int(row["answer_input_tokens_est"]) for row in results if row.get("answer_input_tokens_est") is not None]
+    elapsed_values = [float(row["elapsed_ms"]) for row in results if row.get("elapsed_ms") is not None]
+    search_values = [float(row["search_elapsed_ms"]) for row in results if row.get("search_elapsed_ms") is not None]
+    answer_values = [float(row["answer_elapsed_ms"]) for row in results if row.get("answer_elapsed_ms") is not None]
+    ingest_metric_rows = [
+        dict(row["ingest_metrics"])
+        for row in ingest_rows
+        if isinstance(row.get("ingest_metrics"), dict)
+    ]
+    ingest_elapsed_values = [float(row["ingest_elapsed_ms"]) for row in ingest_rows if row.get("ingest_elapsed_ms") is not None]
+    judge_mean, judge_std, judge_run_scores = summarize_judge_runs(results)
+
+    return {
+        "sample_count": len(samples),
+        "question_count": len(results),
+        "answer_f1": round(sum(float(row["answer_f1"]) for row in results) / len(results), 4) if results else None,
+        "bleu1": round(sum(float(row["bleu1"]) for row in results) / len(results), 4) if results else None,
+        "avg_elapsed_ms": round(sum(elapsed_values) / len(elapsed_values), 2) if elapsed_values else None,
+        "avg_search_elapsed_ms": round(sum(search_values) / len(search_values), 2) if search_values else None,
+        "avg_answer_elapsed_ms": round(sum(answer_values) / len(answer_values), 2) if answer_values else None,
+        "avg_answer_input_tokens_est": round(sum(token_values) / len(token_values), 2) if token_values else None,
+        "p50_answer_input_tokens_est": int(statistics.median(token_values)) if token_values else None,
+        "judge_mean": judge_mean,
+        "judge_std": judge_std,
+        "judge_run_scores": judge_run_scores,
+        "judge_runs": judge_runs if judge_with_llm else 0,
+        "judge_count": sum(1 for row in results if row.get("judge_score") is not None),
+        "ingest_reused_count": sum(1 for row in ingest_rows if row["reused"]),
+        "ingest_new_count": sum(1 for row in ingest_rows if row["ingested"]),
+        "ingest_avg_elapsed_ms": round(sum(ingest_elapsed_values) / len(ingest_elapsed_values), 2) if ingest_elapsed_values else None,
+        "ingest_elapsed_ms_total": round(sum(ingest_elapsed_values), 2) if ingest_elapsed_values else None,
+        "ingest_turn_count_total": sum(int(row.get("turn_count") or 0) for row in ingest_rows),
+        "ingest_session_count_total": sum(int(row.get("session_count") or 0) for row in ingest_rows),
+        "ingest_events_written_total": sum(int(row.get("events_written") or 0) for row in ingest_metric_rows),
+        "ingest_atoms_written_total": sum(int(row.get("atoms_written") or 0) for row in ingest_metric_rows),
+        "ingest_objects_written_total": sum(int(row.get("objects_written") or 0) for row in ingest_metric_rows),
+        "ingest_state_candidates_total": sum(int(row.get("state_candidates") or 0) for row in ingest_metric_rows),
+        "ingest_evidence_links_written_total": sum(int(row.get("evidence_links_written") or 0) for row in ingest_metric_rows),
+        "ingest_input_text_chars_total": sum(int(row.get("input_text_chars") or 0) for row in ingest_metric_rows),
+        "ingest_input_text_tokens_est_total": sum(int(row.get("input_text_tokens_est") or 0) for row in ingest_metric_rows),
+        "ingest_snapshot_upserts_total": sum(int(row.get("snapshot_upserts_total") or 0) for row in ingest_metric_rows),
+        "ingest_memory_llm_calls_est_total": add_numeric_maps(
+            [
+                dict(row.get("memory_llm_calls_est") or {})
+                for row in ingest_metric_rows
+                if isinstance(row.get("memory_llm_calls_est"), dict)
+            ]
+        ),
+        "ingest_state_action_counts_total": add_numeric_maps(
+            [
+                dict(row.get("state_action_counts") or {})
+                for row in ingest_metric_rows
+                if isinstance(row.get("state_action_counts"), dict)
+            ]
+        ),
+        "ingest_snapshot_upserts_by_kind_total": add_numeric_maps(
+            [
+                dict(row.get("snapshot_upserts_by_kind") or {})
+                for row in ingest_metric_rows
+                if isinstance(row.get("snapshot_upserts_by_kind"), dict)
+            ]
+        ),
+        "by_category": {
+            name: summarize_category(rows)
+            for name, rows in sorted(categories.items())
+        },
+    }
+
+
+def build_payload(
+    *,
+    args: argparse.Namespace,
+    samples: list[dict[str, Any]],
+    ingest_rows: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+    completed: bool,
+    qa_progress_path: Path | None = None,
+) -> dict[str, Any]:
+    return {
+        "input": str(args.input),
+        "db": str(args.db),
+        "snapshot_limit": args.snapshot_limit,
+        "raw_span_limit": args.raw_span_limit,
+        "answer_view_mode": args.answer_view_mode,
+        "ingest_prepare_workers": int(os.environ.get("LEAF_INGEST_PREPARE_WORKERS", "4") or "4"),
+        "sample_limit": args.sample_limit,
+        "qa_per_sample": args.qa_per_sample,
+        "judge_with_llm": args.judge_with_llm,
+        "judge_runs": args.judge_runs if args.judge_with_llm else 0,
+        "completed": completed,
+        "qa_progress_path": str(qa_progress_path) if qa_progress_path is not None else None,
+        "summary": build_summary(
+            samples=samples,
+            ingest_rows=ingest_rows,
+            results=results,
+            judge_with_llm=args.judge_with_llm,
+            judge_runs=args.judge_runs,
+        ),
+        "ingest": ingest_rows,
+        "results": results,
+    }
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(path)
+
+
+def append_jsonl(path: Path, row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False))
+        handle.write("\n")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate LEAF on LoCoMo with persistent SQLite reuse.")
     parser.add_argument("--config", required=True)
@@ -724,6 +851,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    output_path = Path(args.output)
+    qa_progress_path = output_path.with_name(f"{output_path.stem}.qa_progress.jsonl")
+    qa_progress_path.parent.mkdir(parents=True, exist_ok=True)
+    qa_progress_path.write_text("", encoding="utf-8")
     if args.ingest_prepare_workers > 0:
         os.environ["LEAF_INGEST_PREPARE_WORKERS"] = str(max(1, args.ingest_prepare_workers))
     service = LEAFService(config_path=args.config, db_path=args.db)
@@ -791,15 +922,19 @@ def main() -> None:
                 search_elapsed_ms = (time.perf_counter() - search_started) * 1000.0
 
                 answer_started = time.perf_counter()
+                context_lines = build_answer_context_lines(evidence)
                 heuristic_answer = heuristic_answer_from_evidence(question=question, evidence=evidence)
+                answer_view: dict[str, Any] = {}
+                answer_view_text = ""
+                answer_messages: list[dict[str, str]] = []
+                answer_prompt_used = False
+                answer_prompt_mode = "heuristic" if heuristic_answer else "llm"
+                answer_prompt_input_tokens_est = 0
+                answer_max_tokens = 0
                 if heuristic_answer:
                     predicted_answer = heuristic_answer
                     answer_input_tokens_est = 0
-                    answer_view = {}
-                    answer_view_text = ""
-                    context_lines = build_answer_context_lines(evidence)
                 else:
-                    context_lines = build_answer_context_lines(evidence)
                     answer_view = build_compact_answer_view(
                         question=question,
                         evidence=evidence,
@@ -812,7 +947,9 @@ def main() -> None:
                         context_lines=context_lines,
                         answer_view_text=answer_view_text,
                     )
-                    answer_input_tokens_est = estimate_message_tokens(answer_messages)
+                    answer_prompt_input_tokens_est = estimate_message_tokens(answer_messages)
+                    answer_input_tokens_est = answer_prompt_input_tokens_est
+                    answer_prompt_used = True
                     try:
                         answer_max_tokens = 96 if is_inference_query(question) else 80
                         predicted_answer = (
@@ -829,43 +966,63 @@ def main() -> None:
                     flush=True,
                 )
 
-                results.append(
-                    {
-                        "sample_id": sample_id,
-                        "corpus_id": corpus_id,
-                        "question_index": int(qa["question_index"]),
-                        "qa_id": qa["qa_id"],
-                        "question": question,
-                        "gold_answer": gold_answer,
-                        "predicted_answer": predicted_answer,
-                        "category": qa["category"],
-                        "category_name": qa["category_name"],
-                        "gold_evidence": list(qa["evidence"]),
-                        "answer_f1": round(answer_f1_score(gold_answer, predicted_answer), 4),
-                        "bleu1": round(bleu1_score(gold_answer, predicted_answer), 4),
-                        "search_elapsed_ms": round(search_elapsed_ms, 2),
-                        "answer_elapsed_ms": round(answer_elapsed_ms, 2),
-                        "elapsed_ms": round(search_elapsed_ms + answer_elapsed_ms, 2),
-                        "answer_input_tokens_est": answer_input_tokens_est,
-                        "raw_span_count": len(evidence.get("raw_spans") or []),
-                        "page_count": len(evidence.get("pages") or []),
-                        "atom_count": len(evidence.get("atoms") or []),
-                        "answer_context_line_count": len(context_lines),
-                        "answer_view_summary": summarize_answer_view(answer_view),
-                        "answer_view_text_chars": len(answer_view_text),
-                        "retrieval": {
-                            "traversal_path": list(evidence.get("traversal_path") or []),
-                            "pages": list(evidence.get("pages") or []),
-                            "atoms": list(evidence.get("atoms") or []),
-                            "raw_spans": list(evidence.get("raw_spans") or []),
-                        },
-                        "retrieved_dia_ids": ordered_unique(
-                            [
-                                str((span.get("metadata") or {}).get("dia_id") or "").strip()
-                                for span in (evidence.get("raw_spans") or [])
-                            ]
-                        ),
-                    }
+                row = {
+                    "sample_id": sample_id,
+                    "corpus_id": corpus_id,
+                    "question_index": int(qa["question_index"]),
+                    "qa_id": qa["qa_id"],
+                    "question": question,
+                    "gold_answer": gold_answer,
+                    "predicted_answer": predicted_answer,
+                    "category": qa["category"],
+                    "category_name": qa["category_name"],
+                    "gold_evidence": list(qa["evidence"]),
+                    "answer_f1": round(answer_f1_score(gold_answer, predicted_answer), 4),
+                    "bleu1": round(bleu1_score(gold_answer, predicted_answer), 4),
+                    "search_elapsed_ms": round(search_elapsed_ms, 2),
+                    "answer_elapsed_ms": round(answer_elapsed_ms, 2),
+                    "elapsed_ms": round(search_elapsed_ms + answer_elapsed_ms, 2),
+                    "answer_input_tokens_est": answer_input_tokens_est,
+                    "answer_prompt_input_tokens_est": answer_prompt_input_tokens_est,
+                    "answer_prompt_used": answer_prompt_used,
+                    "answer_prompt_mode": answer_prompt_mode,
+                    "answer_max_tokens": answer_max_tokens,
+                    "heuristic_answer": heuristic_answer,
+                    "raw_span_count": len(evidence.get("raw_spans") or []),
+                    "page_count": len(evidence.get("pages") or []),
+                    "atom_count": len(evidence.get("atoms") or []),
+                    "answer_context_line_count": len(context_lines),
+                    "answer_context_lines": list(context_lines),
+                    "answer_view_summary": summarize_answer_view(answer_view),
+                    "answer_view": answer_view,
+                    "answer_view_text": answer_view_text,
+                    "answer_view_text_chars": len(answer_view_text),
+                    "answer_prompt_messages": answer_messages,
+                    "retrieval": {
+                        "traversal_path": list(evidence.get("traversal_path") or []),
+                        "pages": list(evidence.get("pages") or []),
+                        "atoms": list(evidence.get("atoms") or []),
+                        "raw_spans": list(evidence.get("raw_spans") or []),
+                    },
+                    "retrieved_dia_ids": ordered_unique(
+                        [
+                            str((span.get("metadata") or {}).get("dia_id") or "").strip()
+                            for span in (evidence.get("raw_spans") or [])
+                        ]
+                    ),
+                }
+                results.append(row)
+                append_jsonl(qa_progress_path, row)
+                write_json_atomic(
+                    output_path,
+                    build_payload(
+                        args=args,
+                        samples=samples,
+                        ingest_rows=ingest_rows,
+                        results=results,
+                        completed=False,
+                        qa_progress_path=qa_progress_path,
+                    ),
                 )
 
         if args.judge_with_llm:
@@ -905,98 +1062,16 @@ def main() -> None:
                         if completed % 10 == 0 or completed == len(futures):
                             print(f"judged {completed}/{len(futures)} rows", flush=True)
             results = [row for row in judged_rows if row is not None]
-
-        categories: dict[str, list[dict[str, Any]]] = {}
-        for row in results:
-            categories.setdefault(str(row["category_name"]), []).append(row)
-
-        token_values = [int(row["answer_input_tokens_est"]) for row in results if row.get("answer_input_tokens_est") is not None]
-        elapsed_values = [float(row["elapsed_ms"]) for row in results if row.get("elapsed_ms") is not None]
-        search_values = [float(row["search_elapsed_ms"]) for row in results if row.get("search_elapsed_ms") is not None]
-        answer_values = [float(row["answer_elapsed_ms"]) for row in results if row.get("answer_elapsed_ms") is not None]
-        ingest_metric_rows = [
-            dict(row["ingest_metrics"])
-            for row in ingest_rows
-            if isinstance(row.get("ingest_metrics"), dict)
-        ]
-        ingest_elapsed_values = [float(row["ingest_elapsed_ms"]) for row in ingest_rows if row.get("ingest_elapsed_ms") is not None]
-        judge_mean, judge_std, judge_run_scores = summarize_judge_runs(results)
-
-        summary = {
-            "sample_count": len(samples),
-            "question_count": len(results),
-            "answer_f1": round(sum(float(row["answer_f1"]) for row in results) / len(results), 4) if results else None,
-            "bleu1": round(sum(float(row["bleu1"]) for row in results) / len(results), 4) if results else None,
-            "avg_elapsed_ms": round(sum(elapsed_values) / len(elapsed_values), 2) if elapsed_values else None,
-            "avg_search_elapsed_ms": round(sum(search_values) / len(search_values), 2) if search_values else None,
-            "avg_answer_elapsed_ms": round(sum(answer_values) / len(answer_values), 2) if answer_values else None,
-            "avg_answer_input_tokens_est": round(sum(token_values) / len(token_values), 2) if token_values else None,
-            "p50_answer_input_tokens_est": int(statistics.median(token_values)) if token_values else None,
-            "judge_mean": judge_mean,
-            "judge_std": judge_std,
-            "judge_run_scores": judge_run_scores,
-            "judge_runs": args.judge_runs if args.judge_with_llm else 0,
-            "judge_count": sum(1 for row in results if row.get("judge_score") is not None),
-            "ingest_reused_count": sum(1 for row in ingest_rows if row["reused"]),
-            "ingest_new_count": sum(1 for row in ingest_rows if row["ingested"]),
-            "ingest_avg_elapsed_ms": round(sum(ingest_elapsed_values) / len(ingest_elapsed_values), 2) if ingest_elapsed_values else None,
-            "ingest_elapsed_ms_total": round(sum(ingest_elapsed_values), 2) if ingest_elapsed_values else None,
-            "ingest_turn_count_total": sum(int(row.get("turn_count") or 0) for row in ingest_rows),
-            "ingest_session_count_total": sum(int(row.get("session_count") or 0) for row in ingest_rows),
-            "ingest_events_written_total": sum(int(row.get("events_written") or 0) for row in ingest_metric_rows),
-            "ingest_atoms_written_total": sum(int(row.get("atoms_written") or 0) for row in ingest_metric_rows),
-            "ingest_objects_written_total": sum(int(row.get("objects_written") or 0) for row in ingest_metric_rows),
-            "ingest_state_candidates_total": sum(int(row.get("state_candidates") or 0) for row in ingest_metric_rows),
-            "ingest_evidence_links_written_total": sum(int(row.get("evidence_links_written") or 0) for row in ingest_metric_rows),
-            "ingest_input_text_chars_total": sum(int(row.get("input_text_chars") or 0) for row in ingest_metric_rows),
-            "ingest_input_text_tokens_est_total": sum(int(row.get("input_text_tokens_est") or 0) for row in ingest_metric_rows),
-            "ingest_snapshot_upserts_total": sum(int(row.get("snapshot_upserts_total") or 0) for row in ingest_metric_rows),
-            "ingest_memory_llm_calls_est_total": add_numeric_maps(
-                [
-                    dict(row.get("memory_llm_calls_est") or {})
-                    for row in ingest_metric_rows
-                    if isinstance(row.get("memory_llm_calls_est"), dict)
-                ]
-            ),
-            "ingest_state_action_counts_total": add_numeric_maps(
-                [
-                    dict(row.get("state_action_counts") or {})
-                    for row in ingest_metric_rows
-                    if isinstance(row.get("state_action_counts"), dict)
-                ]
-            ),
-            "ingest_snapshot_upserts_by_kind_total": add_numeric_maps(
-                [
-                    dict(row.get("snapshot_upserts_by_kind") or {})
-                    for row in ingest_metric_rows
-                    if isinstance(row.get("snapshot_upserts_by_kind"), dict)
-                ]
-            ),
-            "by_category": {
-                name: summarize_category(rows)
-                for name, rows in sorted(categories.items())
-            },
-        }
-
-        payload = {
-            "input": str(args.input),
-            "db": str(args.db),
-            "snapshot_limit": args.snapshot_limit,
-            "raw_span_limit": args.raw_span_limit,
-            "answer_view_mode": args.answer_view_mode,
-            "ingest_prepare_workers": int(os.environ.get("LEAF_INGEST_PREPARE_WORKERS", "4") or "4"),
-            "sample_limit": args.sample_limit,
-            "qa_per_sample": args.qa_per_sample,
-            "judge_with_llm": args.judge_with_llm,
-            "judge_runs": args.judge_runs if args.judge_with_llm else 0,
-            "summary": summary,
-            "ingest": ingest_rows,
-            "results": results,
-        }
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(json.dumps({"output": str(output_path), "summary": summary}, ensure_ascii=False, indent=2))
+        payload = build_payload(
+            args=args,
+            samples=samples,
+            ingest_rows=ingest_rows,
+            results=results,
+            completed=True,
+            qa_progress_path=qa_progress_path,
+        )
+        write_json_atomic(output_path, payload)
+        print(json.dumps({"output": str(output_path), "summary": payload["summary"]}, ensure_ascii=False, indent=2))
     finally:
         service.close()
 

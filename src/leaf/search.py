@@ -215,6 +215,33 @@ def _ordered_unique_strings(values: list[str]) -> list[str]:
     return ordered
 
 
+def _trim_repeated_suffix_letter(token: str) -> str:
+    if len(token) >= 3 and token[-1] == token[-2] and token[-1] not in "aeiou":
+        return token[:-1]
+    return token
+
+
+def _token_variants(token: str) -> set[str]:
+    normalized = str(token or "").strip().lower()
+    if not normalized:
+        return set()
+    variants = {normalized}
+    if normalized.endswith("ies") and len(normalized) > 4:
+        variants.add(normalized[:-3] + "y")
+    if normalized.endswith("es") and len(normalized) > 4:
+        variants.add(normalized[:-2])
+    if normalized.endswith("s") and len(normalized) > 4 and not normalized.endswith("ss"):
+        variants.add(normalized[:-1])
+    if normalized.endswith("ing") and len(normalized) > 5:
+        variants.add(_trim_repeated_suffix_letter(normalized[:-3]))
+    if normalized.endswith("ed") and len(normalized) > 4:
+        stem = _trim_repeated_suffix_letter(normalized[:-2])
+        variants.add(stem)
+        if stem.endswith("i") and len(stem) > 3:
+            variants.add(stem[:-1] + "y")
+    return {variant for variant in variants if variant}
+
+
 def _entity_overlap_score(query_entities: list[str], candidate_values: list[str]) -> float:
     normalized_candidates = [str(value or "").strip().lower() for value in candidate_values if str(value or "").strip()]
     if not query_entities or not normalized_candidates:
@@ -300,6 +327,7 @@ def snapshot_to_public_page(snapshot: Any) -> dict[str, Any]:
     payload = snapshot.to_dict()
     payload.pop("embedding", None)
     anchor_span_ids = payload.get("raw_refs") or []
+    metadata = payload.get("metadata") or {}
     return {
         "page_id": payload["snapshot_id"],
         "corpus_id": payload["corpus_id"],
@@ -315,7 +343,8 @@ def snapshot_to_public_page(snapshot: Any) -> dict[str, Any]:
         "anchor_span_ids": anchor_span_ids,
         "child_ids": payload.get("child_ids") or [],
         "time_range": payload.get("time_range"),
-        "metadata": payload.get("metadata") or {},
+        "tags": list(metadata.get("tags") or []),
+        "metadata": metadata,
     }
 
 
@@ -395,8 +424,12 @@ def query_terms(question: str) -> set[str]:
         collapsed = text.replace(" ", "")
         if collapsed and collapsed != text:
             normalized.add(collapsed)
-        if text.endswith("s") and len(text) > 4:
-            normalized.add(text[:-1])
+        for variant in _token_variants(text):
+            normalized.add(variant)
+        for token in re.findall(r"[a-z0-9]+", text):
+            if token in QUERY_STOPWORDS:
+                continue
+            normalized.update(_token_variants(token))
         for alias in QUERY_ALIASES.get(text, set()):
             normalized.add(alias)
         for alias in QUERY_ALIASES.get(collapsed, set()):
@@ -456,15 +489,30 @@ def event_date_key(timestamp: str | None) -> str | None:
 
 
 def _event_tokens(event: Any) -> set[str]:
+    metadata = dict(event.metadata or {})
+    semantic_refs = [str(item).strip() for item in (metadata.get("semantic_refs") or []) if str(item).strip()]
     return query_terms(
         "\n".join(
             [
                 str(event.speaker or ""),
                 str(event.text or ""),
+                str(metadata.get("blip_caption") or ""),
+                " ".join(semantic_refs),
                 " ".join(str(item) for item in (event.canonical_entity_refs or [])),
-                str(event.metadata or {}),
             ]
         )
+    )
+
+
+def _event_support_text(event: Any) -> str:
+    metadata = dict(event.metadata or {})
+    semantic_refs = [str(item).strip() for item in (metadata.get("semantic_refs") or []) if str(item).strip()]
+    return "\n".join(
+        [
+            str(event.text or ""),
+            str(metadata.get("blip_caption") or ""),
+            " ".join(semantic_refs),
+        ]
     )
 
 
@@ -487,6 +535,19 @@ def _is_anchor_style_event(event: Any) -> bool:
         marker in lowered
         for marker in ["this", "that", "take a look", "look at", "check this", "here it is", "photo", "picture"]
     )
+
+
+def _snapshot_recall_priority(snapshot: Any) -> tuple[int, int]:
+    kind = str(snapshot.snapshot_kind or "")
+    kind_priority = {
+        "session_block": 4,
+        "session_page": 3,
+        "entity": 2,
+        "session": 1,
+        "root": 0,
+    }.get(kind, 0)
+    event_count = len(list(snapshot.event_ids or []))
+    return kind_priority, event_count
 
 
 def retrieve_leaf_memory(
@@ -564,6 +625,7 @@ def retrieve_leaf_memory(
     def score_snapshot(snapshot: Any) -> float:
         metadata = dict(snapshot.metadata or {})
         semantic_role = str(metadata.get("semantic_role") or "")
+        tags = [str(item).strip().lower() for item in (metadata.get("tags") or []) if str(item).strip()]
         snapshot_entities = [str(item).lower() for item in (snapshot.canonical_entity_refs or snapshot.entity_refs or [])]
         score = 0.72 * score_embedding(snapshot.embedding)
         score += 0.48 * text_overlap_score(
@@ -572,9 +634,12 @@ def retrieve_leaf_memory(
             snapshot.summary,
             " ".join(snapshot.entity_refs),
             " ".join(snapshot.canonical_entity_refs),
+            " ".join(tags),
             semantic_role,
         )
         score += min(0.38, _entity_overlap_score(query_entities, snapshot_entities + [str(snapshot.scope_id)]) * 0.38)
+        if tags:
+            score += min(0.18, text_overlap_score(" ".join(tags)) * 0.22)
         score += min(0.18, text_overlap_score(snapshot.title) * 0.24)
         if snapshot.snapshot_kind == "entity" and str(snapshot.scope_id).lower() in set(query_entities).union(normalized_query_terms):
             score += 0.42
@@ -686,19 +751,58 @@ def retrieve_leaf_memory(
             break
     traversed_snapshots.extend(fallback_snapshots)
 
-    snapshot_event_ids: list[str] = []
+    primary_snapshot_event_ids: list[str] = []
+    recall_snapshot_event_ids: list[str] = []
     selected_object_ids: list[str] = []
+    recall_snapshot_event_bonus_by_id: dict[str, float] = defaultdict(float)
     for snapshot in traversed_snapshots:
         for event_id in snapshot.event_ids:
-            if event_id not in snapshot_event_ids:
-                snapshot_event_ids.append(event_id)
+            if event_id not in primary_snapshot_event_ids:
+                primary_snapshot_event_ids.append(event_id)
         for object_id in snapshot.object_ids:
             if object_id not in selected_object_ids:
                 selected_object_ids.append(object_id)
     for snapshot in leaf_snapshots:
         for event_id in snapshot.event_ids:
-            if event_id not in snapshot_event_ids:
-                snapshot_event_ids.append(event_id)
+            if event_id not in primary_snapshot_event_ids:
+                primary_snapshot_event_ids.append(event_id)
+
+    recall_snapshot_limit = max(raw_span_limit * 5, snapshot_limit * 4, 24)
+    if require_entity_coverage or prefer_session_diversity:
+        recall_snapshot_limit += 6
+    if prefer_inference_support:
+        recall_snapshot_limit += 6
+    recall_snapshot_count = 0
+    recall_snapshot_ids: set[str] = set()
+    for snapshot_score, snapshot in scored_all_snapshots:
+        if snapshot.snapshot_id in recall_snapshot_ids:
+            continue
+        kind = str(snapshot.snapshot_kind or "")
+        if kind not in {"entity", "session", "session_page", "session_block"}:
+            continue
+        if kind in {"session_page", "session_block"} and not snapshot.event_ids:
+            continue
+        if kind == "root":
+            continue
+        recall_snapshot_ids.add(snapshot.snapshot_id)
+        recall_snapshot_count += 1
+        kind_priority, event_count = _snapshot_recall_priority(snapshot)
+        recall_bonus = min(0.24, snapshot_score * 0.06)
+        recall_bonus += min(0.08, kind_priority * 0.02)
+        recall_bonus += min(0.08, event_count * 0.01)
+        if snapshot.snapshot_id not in traversed_ids:
+            recall_bonus += 0.04
+        for event_id in snapshot.event_ids:
+            if event_id in primary_snapshot_event_ids:
+                continue
+            if event_id not in recall_snapshot_event_ids:
+                recall_snapshot_event_ids.append(event_id)
+            recall_snapshot_event_bonus_by_id[event_id] += min(0.12, recall_bonus * 0.5)
+        for object_id in snapshot.object_ids:
+            if object_id not in selected_object_ids:
+                selected_object_ids.append(object_id)
+        if recall_snapshot_count >= recall_snapshot_limit:
+            break
 
     entity_scope_ids = [snapshot.scope_id for snapshot in traversed_snapshots if snapshot.snapshot_kind == "entity"]
     for entity in query_entities:
@@ -718,18 +822,27 @@ def retrieve_leaf_memory(
         speaker_events[str(event.speaker)].append(event)
         if session_id not in ordered_session_ids:
             ordered_session_ids.append(session_id)
+        support_text = _event_support_text(event)
         score = 0.84 * score_embedding(event.embedding)
         score += 0.58 * text_overlap_score(
             event.text,
+            support_text,
             " ".join(event.canonical_entity_refs),
-            str(event.metadata),
             str(event.speaker),
         )
+        score += 0.12 * text_overlap_score(support_text)
+        lexical_hits = normalized_query_terms.intersection(_event_tokens(event))
+        salient_hits = [
+            token
+            for token in lexical_hits
+            if len(token) > 4 and token not in query_entities
+        ]
+        score += min(0.22, len(salient_hits) * 0.05)
         score += score_temporal(event.timestamp)
         score += score_speaker(event.speaker)
         if single_fact_query:
             score += 0.12 * text_overlap_score(event.text)
-        if event.event_id in snapshot_event_ids:
+        if event.event_id in primary_snapshot_event_ids:
             score += 0.18
         if prefer_inference_support and event.canonical_entity_refs:
             score += 0.05
@@ -747,8 +860,11 @@ def retrieve_leaf_memory(
         candidate_event_ids.add(event.event_id)
         candidate_events.append(event)
 
-    for event_id in snapshot_event_ids:
+    for event_id in primary_snapshot_event_ids:
         append_candidate(event_lookup.get(event_id))
+    for event_id in recall_snapshot_event_ids:
+        append_candidate(event_lookup.get(event_id))
+        candidate_bonus_by_event[event_id] += float(recall_snapshot_event_bonus_by_id.get(event_id, 0.0))
 
     direct_seed_limit = max(raw_span_limit * 6, 24)
     direct_seed_events = [event for _, event in scored_events[:direct_seed_limit]]
