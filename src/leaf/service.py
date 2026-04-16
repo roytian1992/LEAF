@@ -16,6 +16,7 @@ class LEAFService:
     def __init__(self, config_path: str | Path, db_path: str | Path):
         self.config = load_config(config_path)
         self.store = SQLiteMemoryStore(db_path)
+        self._search_corpus_cache: dict[str, dict[str, Any]] = {}
         self.llm = ChatClient(self.config.llm) if self.config.llm.base_url else None
         self.memory_llm = (
             ChatClient(self.config.additional_llm)
@@ -40,6 +41,7 @@ class LEAFService:
         return self.append_turns(corpus_id=corpus_id, title=title, turns=turns)
 
     def append_turns(self, corpus_id: str, title: str, turns: list[dict[str, Any]]) -> dict[str, Any]:
+        self._search_corpus_cache.pop(str(corpus_id), None)
         return self.indexer.append_turns(corpus_id=corpus_id, title=title, turns=turns)
 
     def search(
@@ -51,6 +53,7 @@ class LEAFService:
     ) -> dict[str, Any]:
         if self.embedding is None:
             raise RuntimeError("Embedding model is not configured.")
+        corpus_cache = self._get_search_corpus_cache(corpus_id)
         return retrieve_leaf_memory(
             store=self.store,
             corpus_id=corpus_id,
@@ -58,6 +61,7 @@ class LEAFService:
             embedding=self.embedding,
             snapshot_limit=snapshot_limit,
             raw_span_limit=raw_span_limit,
+            corpus_cache=corpus_cache,
         )
 
     def get_root_snapshot(self, corpus_id: str) -> dict[str, Any] | None:
@@ -126,6 +130,46 @@ class LEAFService:
     def list_corpora(self) -> list[str]:
         return self.store.list_corpora()
 
+    def _get_search_corpus_cache(self, corpus_id: str) -> dict[str, Any]:
+        key = str(corpus_id)
+        cached = self._search_corpus_cache.get(key)
+        if cached is not None:
+            return cached
+        root_snapshot = self.store.get_snapshot(corpus_id=key, snapshot_kind="root", scope_id=key)
+        entity_snapshots = self.store.list_snapshots(corpus_id=key, snapshot_kind="entity")
+        session_snapshots = self.store.list_snapshots(corpus_id=key, snapshot_kind="session")
+        session_pages = self.store.list_snapshots(corpus_id=key, snapshot_kind="session_page")
+        session_blocks = self.store.list_snapshots(corpus_id=key, snapshot_kind="session_block")
+        all_events = self.store.get_events(corpus_id=key)
+        event_lookup = {event.event_id: event for event in all_events}
+        session_turn_lookup: dict[str, dict[int, Any]] = {}
+        ordered_session_ids: list[str] = []
+        for event in all_events:
+            session_id = str(event.session_id)
+            if session_id not in session_turn_lookup:
+                session_turn_lookup[session_id] = {}
+                ordered_session_ids.append(session_id)
+            session_turn_lookup[session_id][int(event.turn_index)] = event
+        cached = {
+            "root_snapshot": root_snapshot,
+            "entity_snapshots": entity_snapshots,
+            "session_snapshots": session_snapshots,
+            "session_pages": session_pages,
+            "session_blocks": session_blocks,
+            "all_events": all_events,
+            "event_lookup": event_lookup,
+            "session_turn_lookup": session_turn_lookup,
+            "ordered_session_ids": ordered_session_ids,
+            "entity_events": {},
+            "objects_by_subject": {},
+            "object_by_id": {},
+            "latest_version_by_object": {},
+            "token_to_event_ids": None,
+            "session_event_rows": {},
+        }
+        self._search_corpus_cache[key] = cached
+        return cached
+
     @staticmethod
     def _normalize_turns(payload: Any) -> list[dict[str, Any]]:
         if isinstance(payload, list):
@@ -138,4 +182,3 @@ class LEAFService:
             if isinstance(payload.get("messages"), list):
                 return [item for item in payload["messages"] if isinstance(item, dict)]
         raise ValueError("Unsupported conversation JSON format")
-
