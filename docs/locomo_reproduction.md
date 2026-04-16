@@ -19,6 +19,11 @@ In other words:
 LEAF can also be run incrementally in an online setting, but that should be
 reported separately from the full-conversation setup.
 
+With the current packaging, this distinction is explicit:
+
+- `online` ingest mode is for incremental turn-by-turn updates
+- `migration` ingest mode is for offline corpus loading / rebuild-style runs
+
 ## Separation of Roles
 
 LEAF separates three roles that are often conflated in memory-system
@@ -44,6 +49,10 @@ Each turn is processed as follows:
 3. Extract memory atoms from that turn.
 4. Reconcile state-like atoms into evolving memory objects and versions.
 5. Refresh the session, entity, and root snapshots.
+
+When using `migration` mode, LEAF may additionally run corpus-wide post-ingest
+steps such as derived-snapshot rebuilds or optional bridge/facet backfills. If
+those are enabled, they should be reported explicitly.
 
 The important design choice is that raw textual evidence is not discarded after
 abstraction. The hierarchy is additive:

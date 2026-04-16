@@ -16,6 +16,15 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--corpus-id", required=True)
     ingest.add_argument("--title", required=True)
     ingest.add_argument("--input", required=True)
+    ingest.add_argument("--ingest-mode", choices=["online", "migration"], default=None)
+
+    migrate = subparsers.add_parser("migrate-corpus", help="Run migration-style snapshot/backfill steps on an existing corpus")
+    migrate.add_argument("--corpus-id", required=True)
+    migrate.add_argument("--title", default=None)
+    migrate.add_argument("--no-refresh-derived", action="store_true")
+    migrate.add_argument("--build-entity-facets", action="store_true")
+    migrate.add_argument("--build-entity-bridges", action="store_true")
+    migrate.add_argument("--bridge-mode", choices=["hybrid", "embedding_cluster", "graph_lexical"], default=None)
 
     search = subparsers.add_parser("search", help="Search memory using LEAF retrieval")
     search.add_argument("--corpus-id", required=True)
@@ -47,7 +56,21 @@ def main() -> None:
     service = LEAFService(config_path=args.config, db_path=args.db)
     try:
         if args.command == "ingest-json":
-            result = service.append_json(corpus_id=args.corpus_id, title=args.title, path=args.input)
+            result = service.append_json(
+                corpus_id=args.corpus_id,
+                title=args.title,
+                path=args.input,
+                ingest_mode=args.ingest_mode,
+            )
+        elif args.command == "migrate-corpus":
+            result = service.migrate_corpus(
+                corpus_id=args.corpus_id,
+                title=args.title,
+                refresh_derived=not args.no_refresh_derived,
+                build_entity_facets=args.build_entity_facets,
+                build_entity_bridges=args.build_entity_bridges,
+                bridge_mode=args.bridge_mode,
+            )
         elif args.command == "search":
             result = service.search(corpus_id=args.corpus_id, question=args.text, raw_span_limit=args.raw_span_limit)
         elif args.command == "get-root":

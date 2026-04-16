@@ -64,6 +64,22 @@ Edit `examples/config.yaml` to point to your OpenAI-compatible service endpoints
 
 The memory model is used during ingestion for atom extraction and reconciliation. If `additional_llm` is omitted, LEAF falls back to `llm`.
 
+LEAF now exposes two ingest workflows through the same API:
+
+- `online`: incremental append, intended for normal live usage
+- `migration`: append plus corpus-wide post-processing, intended for offline historical loads, rebuilds, or snapshot backfills
+
+The optional `ingest` section in `examples/config.yaml` controls the default:
+
+```yaml
+ingest:
+  mode: online
+  migration_refresh_derived: true
+  migration_build_entity_facets: false
+  migration_build_entity_bridges: false
+  migration_bridge_mode: hybrid
+```
+
 ## Quick Start
 
 ### 1. Ingest a conversation JSON
@@ -76,6 +92,19 @@ leaf \
   --corpus-id demo \
   --title "Demo Conversation" \
   --input examples/demo_conversation.json
+```
+
+To force the offline migration-style path for a bulk historical load:
+
+```bash
+leaf \
+  --config examples/config.yaml \
+  --db data/leaf.sqlite3 \
+  ingest-json \
+  --corpus-id demo \
+  --title "Demo Conversation" \
+  --input examples/demo_conversation.json \
+  --ingest-mode migration
 ```
 
 Accepted JSON formats include:
@@ -124,6 +153,17 @@ leaf --config examples/config.yaml --db data/leaf.sqlite3 get-entity --corpus-id
 leaf --config examples/config.yaml --db data/leaf.sqlite3 get-timeline --corpus-id demo --entity caroline
 ```
 
+To run migration-only backfill steps on an already ingested corpus:
+
+```bash
+leaf \
+  --config examples/config.yaml \
+  --db data/leaf.sqlite3 \
+  migrate-corpus \
+  --corpus-id demo \
+  --build-entity-bridges
+```
+
 ### 4. Use the Python API
 
 ```python
@@ -146,6 +186,17 @@ finally:
     service.close()
 ```
 
+If you want the offline migration-style path through the Python API:
+
+```python
+service.append_json(
+    corpus_id="demo",
+    title="Demo Conversation",
+    path="examples/demo_conversation.json",
+    ingest_mode="migration",
+)
+```
+
 ### 5. Run an Incremental Chat-Loop Demo
 
 The repository also includes a minimal script showing how LEAF is updated turn by turn and then queried:
@@ -162,6 +213,8 @@ This is the closest example to an online memory workflow:
 - append new conversational turns incrementally
 - maintain the evolving memory state in SQLite
 - retrieve grounded memory for a downstream question
+
+For offline historical imports or benchmark rebuilds, prefer `migration` mode instead of this chat-loop style path.
 
 ## Design Notes
 

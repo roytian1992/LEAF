@@ -15,3 +15,10 @@ additional_llm:
   model_name: your-memory-model
   api_key: your-memory-model-key
   base_url: http://your-memory-model-endpoint/v1
+
+ingest:
+  mode: online
+  migration_refresh_derived: true
+  migration_build_entity_facets: false
+  migration_build_entity_bridges: false
+  migration_bridge_mode: hybrid

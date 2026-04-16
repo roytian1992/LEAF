@@ -19,6 +19,133 @@ MONTH_NAMES = {
     12: "December",
 }
 
+WEEKDAY_NAMES = {
+    "mon": "Monday",
+    "monday": "Monday",
+    "tue": "Tuesday",
+    "tues": "Tuesday",
+    "tuesday": "Tuesday",
+    "wed": "Wednesday",
+    "weds": "Wednesday",
+    "wednesday": "Wednesday",
+    "thu": "Thursday",
+    "thur": "Thursday",
+    "thurs": "Thursday",
+    "thursday": "Thursday",
+    "fri": "Friday",
+    "friday": "Friday",
+    "sat": "Saturday",
+    "saturday": "Saturday",
+    "sun": "Sunday",
+    "sunday": "Sunday",
+}
+
+NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+WEEKDAY_PATTERN = r"(mon|monday|tue|tues|tuesday|wed|weds|wednesday|thu|thur|thurs|thursday|fri|friday|sat|saturday|sun|sunday)"
+
+TEMPORAL_PATTERN_SPECS = (
+    {
+        "name": "days_ago",
+        "pattern": re.compile(r"\b(?P<value>\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+days?\s+ago\b"),
+        "kind": "days_ago",
+        "precision": "date",
+    },
+    {
+        "name": "yesterday",
+        "pattern": re.compile(r"\byesterday\b"),
+        "kind": "day_offset",
+        "precision": "date",
+        "offset_days": -1,
+    },
+    {
+        "name": "today",
+        "pattern": re.compile(r"\btoday\b"),
+        "kind": "day_offset",
+        "precision": "date",
+        "offset_days": 0,
+    },
+    {
+        "name": "last_year",
+        "pattern": re.compile(r"\blast year\b"),
+        "kind": "year_offset",
+        "precision": "year",
+        "offset_years": -1,
+    },
+    {
+        "name": "this_year",
+        "pattern": re.compile(r"\bthis year\b"),
+        "kind": "year_offset",
+        "precision": "year",
+        "offset_years": 0,
+    },
+    {
+        "name": "last_month",
+        "pattern": re.compile(r"\blast month\b"),
+        "kind": "month_offset",
+        "precision": "month",
+        "offset_months": -1,
+    },
+    {
+        "name": "next_month",
+        "pattern": re.compile(r"\bnext month\b"),
+        "kind": "month_offset",
+        "precision": "month",
+        "offset_months": 1,
+    },
+    {
+        "name": "this_month",
+        "pattern": re.compile(r"\bthis month\b"),
+        "kind": "current_month",
+        "precision": "month",
+    },
+    {
+        "name": "this_week",
+        "pattern": re.compile(r"\bthis week\b"),
+        "kind": "relative_label",
+        "precision": "relative",
+        "label": "week of",
+    },
+    {
+        "name": "last_week",
+        "pattern": re.compile(r"\blast week\b"),
+        "kind": "relative_label",
+        "precision": "relative",
+        "label": "week before",
+    },
+    {
+        "name": "next_week",
+        "pattern": re.compile(r"\bnext week\b"),
+        "kind": "relative_label",
+        "precision": "relative",
+        "label": "week after",
+    },
+    {
+        "name": "last_weekend",
+        "pattern": re.compile(r"\blast weekend\b"),
+        "kind": "relative_label",
+        "precision": "relative",
+        "label": "weekend before",
+    },
+    {
+        "name": "last_weekday",
+        "pattern": re.compile(rf"\blast\s+(?P<weekday>{WEEKDAY_PATTERN})\b"),
+        "kind": "last_weekday",
+        "precision": "relative",
+    },
+)
+
 TEMPORAL_QUERY_HINTS = {"when", "date", "day", "month", "year", "time"}
 INFERENCE_QUERY_PATTERNS = (
     "would ",
@@ -70,8 +197,90 @@ def parse_anchor_datetime(timestamp: str | None) -> datetime | None:
     return None
 
 
-def derive_temporal_grounding(text: str, timestamp: str | None) -> dict[str, Any]:
+def match_temporal_pattern(text: str) -> tuple[dict[str, Any] | None, re.Match[str] | None]:
     lowered = str(text or "").strip().lower()
+    if not lowered:
+        return None, None
+    for spec in TEMPORAL_PATTERN_SPECS:
+        match = spec["pattern"].search(lowered)
+        if match:
+            return spec, match
+    return None, None
+
+
+def has_temporal_pattern(text: str) -> bool:
+    spec, _ = match_temporal_pattern(text)
+    return spec is not None
+
+
+def _relative_anchor_text(anchor: datetime) -> str:
+    return f"{anchor.day} {MONTH_NAMES.get(anchor.month, anchor.month)} {anchor.year}"
+
+
+def _month_offset(anchor: datetime, offset_months: int) -> tuple[int, int]:
+    total = (anchor.year * 12 + (anchor.month - 1)) + offset_months
+    year = total // 12
+    month = (total % 12) + 1
+    return year, month
+
+
+def _apply_temporal_pattern(
+    spec: dict[str, Any],
+    match: re.Match[str] | None,
+    anchor: datetime,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "anchor_date": anchor.strftime("%Y-%m-%d"),
+        "anchor_month": anchor.strftime("%Y-%m"),
+        "anchor_year": anchor.year,
+    }
+    kind = str(spec.get("kind") or "")
+    precision = str(spec.get("precision") or "")
+    if kind == "days_ago":
+        raw_value = str((match.group("value") if match is not None else "") or "").strip().lower()
+        delta_days = int(raw_value) if raw_value.isdigit() else NUMBER_WORDS.get(raw_value)
+        if delta_days is None:
+            return payload
+        grounded = anchor - timedelta(days=delta_days)
+        payload["grounded_date"] = grounded.strftime("%Y-%m-%d")
+        payload["precision"] = precision
+        return payload
+    if kind == "day_offset":
+        grounded = anchor + timedelta(days=int(spec.get("offset_days") or 0))
+        payload["grounded_date"] = grounded.strftime("%Y-%m-%d")
+        payload["precision"] = precision
+        return payload
+    if kind == "year_offset":
+        payload["grounded_year"] = anchor.year + int(spec.get("offset_years") or 0)
+        payload["precision"] = precision
+        return payload
+    if kind == "month_offset":
+        year, month = _month_offset(anchor, int(spec.get("offset_months") or 0))
+        payload["grounded_month"] = f"{year:04d}-{month:02d}"
+        payload["precision"] = precision
+        return payload
+    if kind == "current_month":
+        payload["grounded_month"] = anchor.strftime("%Y-%m")
+        payload["precision"] = precision
+        return payload
+    if kind == "relative_label":
+        payload["grounded_relative"] = f"{spec.get('label')} {_relative_anchor_text(anchor)}"
+        payload["precision"] = precision
+        return payload
+    if kind == "last_weekday":
+        weekday_key = str((match.group("weekday") if match is not None else "") or "").strip().lower()
+        weekday_name = WEEKDAY_NAMES.get(weekday_key)
+        if not weekday_name:
+            return payload
+        payload["grounded_relative"] = f"{weekday_name} before {_relative_anchor_text(anchor)}"
+        payload["precision"] = precision
+        return payload
+    payload["grounded_date"] = anchor.strftime("%Y-%m-%d")
+    payload["precision"] = "anchor"
+    return payload
+
+
+def derive_temporal_grounding(text: str, timestamp: str | None) -> dict[str, Any]:
     anchor = parse_anchor_datetime(timestamp)
     payload: dict[str, Any] = {}
     if anchor is not None:
@@ -81,38 +290,18 @@ def derive_temporal_grounding(text: str, timestamp: str | None) -> dict[str, Any
 
     if anchor is None:
         return payload
-
-    if "yesterday" in lowered:
-        grounded = anchor - timedelta(days=1)
-        payload["grounded_date"] = grounded.strftime("%Y-%m-%d")
-        payload["precision"] = "date"
-    elif "today" in lowered:
-        payload["grounded_date"] = anchor.strftime("%Y-%m-%d")
-        payload["precision"] = "date"
-    elif "last year" in lowered:
-        payload["grounded_year"] = anchor.year - 1
-        payload["precision"] = "year"
-    elif "this year" in lowered:
-        payload["grounded_year"] = anchor.year
-        payload["precision"] = "year"
-    elif "last month" in lowered:
-        year = anchor.year
-        month = anchor.month - 1
-        if month == 0:
-            month = 12
-            year -= 1
-        payload["grounded_month"] = f"{year:04d}-{month:02d}"
-        payload["precision"] = "month"
-    elif "this month" in lowered:
-        payload["grounded_month"] = anchor.strftime("%Y-%m")
-        payload["precision"] = "month"
-    else:
+    spec, match = match_temporal_pattern(text)
+    if spec is None:
         payload["grounded_date"] = anchor.strftime("%Y-%m-%d")
         payload["precision"] = "anchor"
-    return payload
+        return payload
+    return _apply_temporal_pattern(spec, match, anchor)
 
 
 def format_grounded_value(grounding: dict[str, Any]) -> str | None:
+    if grounding.get("precision") == "relative" and grounding.get("grounded_relative"):
+        value = str(grounding["grounded_relative"]).strip()
+        return value[:1].upper() + value[1:] if value else None
     if grounding.get("precision") == "year" and grounding.get("grounded_year"):
         return str(grounding["grounded_year"])
     if grounding.get("precision") == "month" and grounding.get("grounded_month"):
@@ -139,34 +328,27 @@ def canonicalize_temporal_answer(question: str, predicted_answer: str | None, ev
     answer = str(predicted_answer or "").strip()
     if not answer or answer.upper() == "UNKNOWN" or not is_temporal_query(question):
         return predicted_answer
-    lowered = answer.lower()
-    if not any(marker in lowered for marker in ["yesterday", "today", "last year", "this year", "last month", "this month"]):
+    answer_spec, _ = match_temporal_pattern(answer)
+    if answer_spec is None:
         return predicted_answer
 
     raw_spans = evidence.get("raw_spans") or []
     candidates: list[tuple[int, str]] = []
     for span in raw_spans:
-        metadata = dict(span.get("metadata") or {})
-        grounding = metadata.get("temporal_grounding")
-        if not isinstance(grounding, dict):
-            grounding = derive_temporal_grounding(
-                text=str(span.get("text") or ""),
-                timestamp=span.get("timestamp"),
-            )
+        grounding = derive_temporal_grounding(
+            text=str(span.get("text") or ""),
+            timestamp=span.get("timestamp"),
+        )
         formatted = format_grounded_value(grounding)
         if not formatted:
             continue
         score = 0
-        span_text = str(span.get("text") or "").lower()
-        if "yesterday" in lowered and "yesterday" in span_text:
+        span_spec, _ = match_temporal_pattern(str(span.get("text") or ""))
+        if span_spec is not None and span_spec.get("name") == answer_spec.get("name"):
             score += 4
-        if "last year" in lowered and "last year" in span_text:
-            score += 4
-        if "this month" in lowered and "this month" in span_text:
-            score += 4
-        if "today" in lowered and "today" in span_text:
-            score += 4
-        if score == 0 and grounding.get("precision") in {"date", "month", "year"}:
+        if span_spec is not None and span_spec.get("precision") == answer_spec.get("precision"):
+            score += 1
+        if score == 0 and grounding.get("precision") in {"date", "month", "year", "relative"}:
             score += 1
         candidates.append((score, formatted))
 

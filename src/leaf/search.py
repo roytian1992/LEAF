@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import time
 from collections import defaultdict
@@ -109,8 +110,12 @@ SEMANTIC_HINTS = {
     "de-stress": ["stress relief", "relax", "unwind", "escape"],
     "martial arts": ["kickboxing", "taekwondo", "karate", "combat sport"],
     "paint": ["painting", "artwork", "canvas", "picture"],
+    "get into": ["started", "got me into", "inspired", "hooked"],
     "education": ["study", "career", "field", "training"],
     "job": ["work", "career", "employment"],
+    "recurring": ["again", "every week", "weekly", "ritual", "keeps happening"],
+    "persistent": ["again", "every week", "weekly", "ritual", "keeps happening"],
+    "frustration": ["again", "every week", "weekly", "ritual", "lost"],
     "identity": ["transgender", "transition", "coming out", "lgbtq", "woman"],
     "relationship status": ["single", "partner", "married", "breakup", "single parent"],
     "career path": ["career", "job", "occupation", "counseling", "mental health"],
@@ -216,12 +221,46 @@ OPEN_DOMAIN_SUPPORT_HINTS = [
 USE_QUERY_HINTS_FOR_LEXICAL = True
 USE_BROAD_BLOCK_EXPANSION = True
 USE_LIGHT_NEIGHBOR_EXPANSION = False
+USE_LEXICAL_EDGE_EXPANSION = False
+USE_SESSION_LOCAL_COMPLETION = False
 ENTITY_EVENT_RECALL_LIMIT = 16
 RECALL_SNAPSHOT_LIMIT_BASE = 32
 TOKEN_EVENT_RECALL_LIMIT = 16
 SESSION_LOCAL_RECALL_LIMIT = 4
 SESSION_LOCAL_SESSION_LIMIT = 6
 OBJECT_SUPPORT_EVENT_LIMIT = 24
+LEXICAL_EDGE_DF_RATIO_LIMIT = 0.18
+LEXICAL_EDGE_STRONG_IDF = 2.8
+LEXICAL_EDGE_SCORE_THRESHOLD = 0.2
+LEXICAL_EDGE_SEED_LIMIT = 12
+LEXICAL_EDGE_TOKEN_LIMIT = 6
+
+GENERIC_EDGE_TOKENS = {
+    "amazing",
+    "awesome",
+    "beautiful",
+    "congrats",
+    "congratulations",
+    "glad",
+    "good",
+    "great",
+    "happy",
+    "love",
+    "lovely",
+    "nice",
+    "photo",
+    "picture",
+    "proud",
+    "sorry",
+    "support",
+    "supportive",
+    "supported",
+    "supporting",
+    "thanks",
+    "thank",
+    "wonderful",
+    "wow",
+}
 
 
 def _ordered_unique_strings(values: list[str]) -> list[str]:
@@ -698,6 +737,9 @@ def _snapshot_recall_priority(snapshot: Any) -> tuple[int, int]:
     kind_priority = {
         "session_block": 4,
         "session_page": 3,
+        "bridge": 3,
+        "entity_facet": 3,
+        "entity_slot": 3,
         "entity": 2,
         "session": 1,
         "root": 0,
@@ -827,6 +869,14 @@ def retrieve_leaf_memory(
             list_query,
         ]
     )
+    enable_lexical_edge_expansion = USE_LEXICAL_EDGE_EXPANSION and any(
+        [
+            require_entity_coverage,
+            prefer_session_diversity,
+            list_query,
+            len(query_entities) >= 2,
+        ]
+    )
     enable_speaker_session_mining = False
     enable_event_atom_rerank = False
     stage_timings_ms["query_feature_prep"] = round((time.perf_counter() - query_feature_prep_started_at) * 1000.0, 2)
@@ -915,6 +965,16 @@ def retrieve_leaf_memory(
         )
         event_tokens_cache[event_id] = cached
         return cached
+
+    def cached_edge_tokens(event: Any) -> set[str]:
+        tokens = cached_event_tokens(event)
+        return {
+            token
+            for token in tokens
+            if len(token) >= 4
+            and token not in GENERIC_EDGE_TOKENS
+            and token not in query_entities
+        }
 
     def cached_event_support_refs(event: Any) -> list[str]:
         event_id = str(event.event_id)
@@ -1005,6 +1065,30 @@ def retrieve_leaf_memory(
         score += min(0.18, text_overlap_score(snapshot.title) * 0.24)
         if snapshot.snapshot_kind == "entity" and str(snapshot.scope_id).lower() in set(query_entities).union(normalized_query_terms):
             score += 0.42
+        if snapshot.snapshot_kind == "entity_slot":
+            slot_name = str((metadata.get("slot") or "")).strip().lower()
+            scope_text = str(snapshot.scope_id or "").strip().lower()
+            score += 0.14
+            if slot_name:
+                if slot_name in normalized_query_terms or any(token in lowered_question for token in slot_name.split("_")):
+                    score += 0.18
+            if scope_text and any(entity and entity in scope_text for entity in query_entities):
+                score += 0.18
+        if snapshot.snapshot_kind == "entity_facet":
+            anchor_terms = [
+                str(item).strip().lower()
+                for item in (metadata.get("anchor_terms") or [])
+                if str(item).strip()
+            ]
+            score += 0.16
+            if anchor_terms:
+                score += min(0.22, text_overlap_score(" ".join(anchor_terms)) * 0.3)
+                if any(term in lowered_question for term in anchor_terms):
+                    score += 0.18
+        if snapshot.snapshot_kind == "bridge":
+            score += 0.16
+            if semantic_role == "entity_bridge":
+                score += 0.08
         if snapshot.snapshot_kind == "session_page":
             score += 0.12
         if snapshot.snapshot_kind == "session_block":
@@ -1024,6 +1108,39 @@ def retrieve_leaf_memory(
         snapshot_score_cache[snapshot_id] = score
         return score
 
+    def filter_entity_derived_snapshots(snapshots: list[Any], *, include_aspect: bool, include_facet: bool = False) -> list[Any]:
+        filtered: list[Any] = []
+        for snapshot in snapshots:
+            metadata = dict(snapshot.metadata or {})
+            subject = str((metadata.get("subject") or "")).strip().lower()
+            slot_name = str((metadata.get("slot") or "")).strip().lower()
+            aspect_terms = [str(item).strip().lower() for item in (metadata.get("aspect_terms") or []) if str(item).strip()]
+            anchor_terms = [str(item).strip().lower() for item in (metadata.get("anchor_terms") or []) if str(item).strip()]
+            scope_text = str(snapshot.scope_id or "").strip().lower()
+            title_text = str(snapshot.title or "").strip().lower()
+            summary_text = str(snapshot.summary or "").strip().lower()
+            subject_match = bool(subject and (subject in query_entities or subject in normalized_query_terms or subject in scope_text))
+            slot_match = bool(
+                slot_name
+                and (
+                    slot_name in normalized_query_terms
+                    or slot_name.replace("_", " ") in lowered_question
+                    or any(token in normalized_query_terms for token in slot_name.split("_"))
+                )
+            )
+            aspect_match = bool(aspect_terms and any(term in normalized_query_terms or term in lowered_question for term in aspect_terms))
+            anchor_match = bool(anchor_terms and any(term in normalized_query_terms or term in lowered_question for term in anchor_terms))
+            lexical_text = [title_text, summary_text, " ".join(aspect_terms)]
+            if include_facet:
+                lexical_text.append(" ".join(anchor_terms))
+            lexical_match = text_overlap_score(*lexical_text) >= (0.06 if include_aspect or include_facet else 0.08)
+            if subject_match and (slot_match or aspect_match or anchor_match or lexical_match):
+                filtered.append(snapshot)
+                continue
+            if (include_aspect or include_facet) and subject_match and list_query:
+                filtered.append(snapshot)
+        return filtered
+
     snapshot_load_started_at = time.perf_counter()
     snapshots: list[Any] = []
     root_snapshot = (corpus_cache or {}).get("root_snapshot")
@@ -1032,6 +1149,11 @@ def retrieve_leaf_memory(
     if root_snapshot is not None:
         snapshots.append(root_snapshot)
     entity_snapshots = list((corpus_cache or {}).get("entity_snapshots") or store.list_snapshots(corpus_id=corpus_id, snapshot_kind="entity"))
+    entity_facet_snapshots = list((corpus_cache or {}).get("entity_facet_snapshots") or store.list_snapshots(corpus_id=corpus_id, snapshot_kind="entity_facet"))
+    entity_facet_snapshots = filter_entity_derived_snapshots(entity_facet_snapshots, include_aspect=False, include_facet=True)
+    entity_slot_snapshots = list((corpus_cache or {}).get("entity_slot_snapshots") or store.list_snapshots(corpus_id=corpus_id, snapshot_kind="entity_slot"))
+    entity_slot_snapshots = filter_entity_derived_snapshots(entity_slot_snapshots, include_aspect=False)
+    bridge_snapshots = list((corpus_cache or {}).get("bridge_snapshots") or store.list_snapshots(corpus_id=corpus_id, snapshot_kind="bridge"))
     session_snapshots = list((corpus_cache or {}).get("session_snapshots") or store.list_snapshots(corpus_id=corpus_id, snapshot_kind="session"))
     if enable_block_expansion:
         session_pages = list((corpus_cache or {}).get("session_pages") or store.list_snapshots(corpus_id=corpus_id, snapshot_kind="session_page"))
@@ -1040,6 +1162,9 @@ def retrieve_leaf_memory(
         session_pages = []
         session_blocks = []
     snapshots.extend(entity_snapshots)
+    snapshots.extend(entity_facet_snapshots)
+    snapshots.extend(entity_slot_snapshots)
+    snapshots.extend(bridge_snapshots)
     snapshots.extend(session_snapshots)
     snapshots.extend(session_pages)
     snapshots.extend(session_blocks)
@@ -1057,6 +1182,9 @@ def retrieve_leaf_memory(
     if root_snapshot is not None:
         top_level_snapshots.append(root_snapshot)
     top_level_snapshots.extend(entity_snapshots)
+    top_level_snapshots.extend(entity_facet_snapshots)
+    top_level_snapshots.extend(entity_slot_snapshots)
+    top_level_snapshots.extend(bridge_snapshots)
     top_level_snapshots.extend(session_snapshots)
     scored_top_level = sorted(
         ((score_snapshot(snapshot), snapshot) for snapshot in top_level_snapshots),
@@ -1087,7 +1215,7 @@ def retrieve_leaf_memory(
             kind = str(snapshot.snapshot_kind or "")
             if snapshot.snapshot_id in traversed_ids:
                 continue
-            if kind not in {"entity", "session", "session_page", "session_block"}:
+            if kind not in {"entity", "entity_facet", "entity_slot", "bridge", "session", "session_page", "session_block"}:
                 continue
             if kind in {"session_page", "session_block"} and not snapshot.event_ids:
                 continue
@@ -1110,6 +1238,23 @@ def retrieve_leaf_memory(
     stage_timings_ms["recall_sweep"] = round((time.perf_counter() - recall_sweep_started_at) * 1000.0, 2)
 
     entity_scope_ids = [snapshot.scope_id for snapshot in traversed_snapshots if snapshot.snapshot_kind == "entity"]
+    for snapshot in traversed_snapshots:
+        if str(snapshot.snapshot_kind or "") == "entity_facet":
+            facet_subject = str((snapshot.metadata or {}).get("subject") or "").strip().lower()
+            if facet_subject and facet_subject not in entity_scope_ids:
+                entity_scope_ids.append(facet_subject)
+            continue
+        if str(snapshot.snapshot_kind or "") != "entity_slot":
+            continue
+        slot_subject = str((snapshot.metadata or {}).get("subject") or "").strip().lower()
+        if slot_subject and slot_subject not in entity_scope_ids:
+            entity_scope_ids.append(slot_subject)
+    for snapshot in traversed_snapshots:
+        if str(snapshot.snapshot_kind or "") != "bridge":
+            continue
+        bridge_entity = str((snapshot.metadata or {}).get("entity") or "").strip().lower()
+        if bridge_entity and bridge_entity not in entity_scope_ids:
+            entity_scope_ids.append(bridge_entity)
     for entity in query_entities:
         if entity and entity not in entity_scope_ids:
             entity_scope_ids.append(entity)
@@ -1119,6 +1264,7 @@ def retrieve_leaf_memory(
     stage_timings_ms["event_load"] = round((time.perf_counter() - event_load_started_at) * 1000.0, 2)
 
     event_lookup = dict((corpus_cache or {}).get("event_lookup") or {event.event_id: event for event in all_events})
+    entity_event_ids = dict((corpus_cache or {}).get("entity_event_ids") or {})
     session_turn_lookup: dict[str, dict[int, Any]] = dict((corpus_cache or {}).get("session_turn_lookup") or {})
     ordered_session_ids: list[str] = list((corpus_cache or {}).get("ordered_session_ids") or [])
     shared_cache = corpus_cache if corpus_cache is not None else {}
@@ -1134,6 +1280,22 @@ def retrieve_leaf_memory(
         token_to_event_ids = dict(built_token_to_event_ids)
         if corpus_cache is not None:
             corpus_cache["token_to_event_ids"] = token_to_event_ids
+
+    token_idf = shared_cache.get("token_idf")
+    token_df_ratio = shared_cache.get("token_df_ratio")
+    if token_idf is None or token_df_ratio is None:
+        event_count = max(1, len(all_events))
+        built_token_idf: dict[str, float] = {}
+        built_token_df_ratio: dict[str, float] = {}
+        for token, event_ids in dict(token_to_event_ids or {}).items():
+            df = max(1, len(event_ids))
+            built_token_idf[str(token)] = math.log((event_count + 1.0) / (df + 1.0)) + 1.0
+            built_token_df_ratio[str(token)] = df / event_count
+        token_idf = built_token_idf
+        token_df_ratio = built_token_df_ratio
+        if corpus_cache is not None:
+            corpus_cache["token_idf"] = token_idf
+            corpus_cache["token_df_ratio"] = token_df_ratio
 
     session_event_rows: dict[str, list[Any]] = shared_cache.get("session_event_rows") or {}
     if not session_event_rows:
@@ -1170,6 +1332,24 @@ def retrieve_leaf_memory(
         score += min(0.3, len(salient_hits) * 0.07)
         if metadata.get("blip_caption") and lexical_hits:
             score += 0.12
+        previous_event = session_turn_lookup.get(str(event.session_id), {}).get(int(event.turn_index) - 1)
+        if previous_event is not None and str(previous_event.speaker or "") != str(event.speaker or ""):
+            previous_text = str(previous_event.text or "")
+            previous_hits = normalized_query_terms.intersection(cached_event_tokens(previous_event))
+            if "?" in previous_text and (lexical_hits or cached_matched_query_entities(event)):
+                score += 0.08
+                if previous_hits:
+                    score += 0.06
+                if str(event.speaker or "").strip().lower() in query_entities:
+                    score += 0.08
+        next_event = session_turn_lookup.get(str(event.session_id), {}).get(int(event.turn_index) + 1)
+        if (
+            next_event is not None
+            and "?" in str(event.text or "")
+            and str(next_event.speaker or "") != str(event.speaker or "")
+            and str(next_event.speaker or "").strip().lower() in query_entities
+        ):
+            score -= 0.08
         score += score_temporal(event.timestamp)
         score += score_speaker(event.speaker)
         if single_fact_query:
@@ -1232,7 +1412,18 @@ def retrieve_leaf_memory(
             entity_events_cache = corpus_cache.setdefault("entity_events", {})
             entity_events = entity_events_cache.get(entity)
             if entity_events is None:
-                entity_events = store.get_events_for_entity(corpus_id=corpus_id, entity=entity, limit=ENTITY_EVENT_RECALL_LIMIT)
+                indexed_event_ids = list(entity_event_ids.get(str(entity or "").strip().lower()) or [])
+                if indexed_event_ids:
+                    entity_events = [
+                        event
+                        for event in (
+                            event_lookup.get(event_id)
+                            for event_id in indexed_event_ids[:ENTITY_EVENT_RECALL_LIMIT]
+                        )
+                        if event is not None
+                    ]
+                else:
+                    entity_events = store.get_events_for_entity(corpus_id=corpus_id, entity=entity, limit=ENTITY_EVENT_RECALL_LIMIT)
                 entity_events_cache[entity] = entity_events
         else:
             entity_events = store.get_events_for_entity(corpus_id=corpus_id, entity=entity, limit=ENTITY_EVENT_RECALL_LIMIT)
@@ -1240,6 +1431,94 @@ def retrieve_leaf_memory(
             append_candidate(event)
             candidate_bonus_by_event[event.event_id] += 0.08
     stage_timings_ms["candidate_assembly_pre_neighbors"] = round((time.perf_counter() - candidate_assembly_started_at) * 1000.0, 2)
+
+    lexical_edge_started_at = time.perf_counter()
+    if enable_lexical_edge_expansion:
+        lexical_edge_seed_events: list[Any] = []
+        lexical_edge_seed_ids: set[str] = set()
+
+        def append_lexical_edge_seed(event: Any | None) -> None:
+            if event is None:
+                return
+            event_id = str(event.event_id)
+            if event_id in lexical_edge_seed_ids:
+                return
+            lexical_edge_seed_ids.add(event_id)
+            lexical_edge_seed_events.append(event)
+
+        for event_id in primary_snapshot_event_ids[:LEXICAL_EDGE_SEED_LIMIT]:
+            append_lexical_edge_seed(event_lookup.get(event_id))
+        for event in direct_seed_events[:LEXICAL_EDGE_SEED_LIMIT]:
+            append_lexical_edge_seed(event)
+
+        for seed_event in lexical_edge_seed_events[:LEXICAL_EDGE_SEED_LIMIT]:
+            seed_tokens = sorted(
+                (
+                    token
+                    for token in cached_edge_tokens(seed_event)
+                    if float((token_df_ratio or {}).get(token, 0.0)) < LEXICAL_EDGE_DF_RATIO_LIMIT
+                ),
+                key=lambda token: (-float((token_idf or {}).get(token, 0.0)), token),
+            )[:LEXICAL_EDGE_TOKEN_LIMIT]
+            if not seed_tokens:
+                continue
+            scored_edge_candidates: dict[str, float] = {}
+            strong_token_hits_by_event: dict[str, int] = defaultdict(int)
+            seed_session_id = str(seed_event.session_id)
+            seed_token_set = set(seed_tokens)
+            for token in seed_tokens:
+                for candidate_event_id in list((token_to_event_ids or {}).get(token) or []):
+                    if candidate_event_id == seed_event.event_id:
+                        continue
+                    candidate_event = event_lookup.get(candidate_event_id)
+                    if candidate_event is None:
+                        continue
+                    if str(candidate_event.session_id) == seed_session_id:
+                        continue
+                    candidate_tokens = {
+                        item
+                        for item in cached_edge_tokens(candidate_event)
+                        if float((token_df_ratio or {}).get(item, 0.0)) < LEXICAL_EDGE_DF_RATIO_LIMIT
+                    }
+                    shared_tokens = seed_token_set.intersection(candidate_tokens)
+                    if not shared_tokens:
+                        continue
+                    shared_weight = sum(float((token_idf or {}).get(item, 1.0)) for item in shared_tokens)
+                    union_tokens = seed_token_set.union(candidate_tokens)
+                    union_weight = sum(float((token_idf or {}).get(item, 1.0)) for item in union_tokens) or 1.0
+                    edge_score = shared_weight / union_weight
+                    if shared_tokens.intersection(set(cached_event_support_refs(candidate_event))):
+                        edge_score += 0.04
+                    if cached_matched_query_entities(candidate_event):
+                        edge_score += 0.04
+                    if any(float((token_idf or {}).get(item, 0.0)) >= LEXICAL_EDGE_STRONG_IDF for item in shared_tokens):
+                        strong_token_hits_by_event[candidate_event_id] += 1
+                        edge_score += 0.06
+                    scored_edge_candidates[candidate_event_id] = max(scored_edge_candidates.get(candidate_event_id, 0.0), edge_score)
+
+            ranked_edge_candidates = sorted(
+                scored_edge_candidates.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            added_sessions_for_seed: set[str] = set()
+            added_count_for_seed = 0
+            for candidate_event_id, edge_score in ranked_edge_candidates:
+                if edge_score < LEXICAL_EDGE_SCORE_THRESHOLD and strong_token_hits_by_event.get(candidate_event_id, 0) == 0:
+                    continue
+                candidate_event = event_lookup.get(candidate_event_id)
+                if candidate_event is None:
+                    continue
+                candidate_session_id = str(candidate_event.session_id)
+                if candidate_session_id in added_sessions_for_seed:
+                    continue
+                append_candidate(candidate_event)
+                candidate_bonus_by_event[candidate_event.event_id] += min(0.16, edge_score * 0.35 + 0.03)
+                added_sessions_for_seed.add(candidate_session_id)
+                added_count_for_seed += 1
+                if added_count_for_seed >= 2:
+                    break
+    stage_timings_ms["lexical_edge_expansion"] = round((time.perf_counter() - lexical_edge_started_at) * 1000.0, 2)
 
     neighbor_expansion_started_at = time.perf_counter()
     if enable_neighbor_expansion:
@@ -1269,6 +1548,68 @@ def retrieve_leaf_memory(
         if len(candidate_events) >= candidate_pool_limit:
             break
     stage_timings_ms["candidate_pool_fill"] = round((time.perf_counter() - candidate_pool_fill_started_at) * 1000.0, 2)
+
+    session_local_mining_started_at = time.perf_counter()
+    if enable_speaker_session_mining:
+        ranked_focus_sessions: list[str] = []
+        focus_session_scores: dict[str, float] = {}
+        focus_session_seed_counts: dict[str, int] = defaultdict(int)
+        for rank_index, (score, event) in enumerate(scored_events[: max(candidate_pool_limit * 2, 48)]):
+            session_id = str(event.session_id)
+            lexical_hits = normalized_query_terms.intersection(cached_event_tokens(event))
+            if not lexical_hits and not cached_matched_query_entities(event):
+                continue
+            session_score = float(score)
+            session_score += min(0.18, len(lexical_hits) * 0.03)
+            session_score += min(0.16, len(cached_matched_query_entities(event)) * 0.08)
+            session_score += max(0.0, 0.08 - rank_index * 0.002)
+            if session_score > focus_session_scores.get(session_id, float("-inf")):
+                focus_session_scores[session_id] = session_score
+            focus_session_seed_counts[session_id] += 1
+        ranked_focus_sessions = [
+            session_id
+            for session_id, _ in sorted(
+                focus_session_scores.items(),
+                key=lambda item: (-(item[1] + min(0.08, focus_session_seed_counts.get(item[0], 0) * 0.02)), item[0]),
+            )[:SESSION_LOCAL_SESSION_LIMIT]
+        ]
+
+        for session_id in ranked_focus_sessions:
+            local_rows: list[tuple[float, Any]] = []
+            session_rows = list(session_event_rows.get(session_id) or [])
+            for event in session_rows:
+                local_score = float(event_base_scores.get(event.event_id, 0.0))
+                lexical_hits = normalized_query_terms.intersection(cached_event_tokens(event))
+                matched_entities = cached_matched_query_entities(event)
+                local_score += min(0.24, len(lexical_hits) * 0.04)
+                local_score += min(0.18, len(matched_entities) * 0.09)
+                session_support_hits = [
+                    ref for ref in cached_event_support_refs(event)
+                    if ref in normalized_query_terms or ref in recall_terms
+                ]
+                local_score += min(0.12, len(session_support_hits) * 0.03)
+                if str(event.speaker or "").strip().lower() in query_entities:
+                    local_score += 0.05
+                prev_event = session_turn_lookup.get(session_id, {}).get(int(event.turn_index) - 1)
+                if prev_event is not None:
+                    prev_text = str(prev_event.text or "")
+                    if "?" in prev_text and str(prev_event.speaker or "") != str(event.speaker or ""):
+                        local_score += 0.08
+                    prev_tokens = cached_event_tokens(prev_event)
+                    if lexical_hits.intersection(prev_tokens):
+                        local_score += 0.04
+                local_rows.append((local_score, event))
+            local_rows.sort(key=lambda item: item[0], reverse=True)
+            added_local = 0
+            for local_score, event in local_rows:
+                if event.event_id in candidate_event_ids:
+                    continue
+                append_candidate(event)
+                candidate_bonus_by_event[event.event_id] += min(0.18, local_score * 0.06 + 0.04)
+                added_local += 1
+                if added_local >= SESSION_LOCAL_RECALL_LIMIT:
+                    break
+    stage_timings_ms["session_local_mining"] = round((time.perf_counter() - session_local_mining_started_at) * 1000.0, 2)
 
     atom_score_by_event: dict[str, float] = defaultdict(float)
     atom_score_rows: list[tuple[float, Any]] = []
@@ -1500,7 +1841,11 @@ def retrieve_leaf_memory(
                 "use_query_hints_for_lexical": USE_QUERY_HINTS_FOR_LEXICAL,
                 "use_broad_block_expansion": USE_BROAD_BLOCK_EXPANSION,
                 "use_light_neighbor_expansion": USE_LIGHT_NEIGHBOR_EXPANSION,
+                "use_lexical_edge_expansion": USE_LEXICAL_EDGE_EXPANSION,
+                "use_session_local_completion": USE_SESSION_LOCAL_COMPLETION,
                 "enable_neighbor_expansion": enable_neighbor_expansion,
+                "enable_lexical_edge_expansion": enable_lexical_edge_expansion,
+                "enable_speaker_session_mining": enable_speaker_session_mining,
                 "enable_event_atom_rerank": enable_event_atom_rerank,
             },
         },

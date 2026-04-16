@@ -401,6 +401,26 @@ class SQLiteMemoryStore:
         ).fetchall()
         return [self._row_to_snapshot(row) for row in rows]
 
+    def delete_snapshots(self, corpus_id: str, snapshot_kind: str) -> int:
+        cur = self.conn.execute(
+            """
+            delete from leaf_snapshots
+            where corpus_id = ? and snapshot_kind = ?
+            """,
+            (corpus_id, snapshot_kind),
+        )
+        return int(cur.rowcount or 0)
+
+    def delete_snapshots_by_scope_prefix(self, corpus_id: str, snapshot_kind: str, scope_prefix: str) -> int:
+        cur = self.conn.execute(
+            """
+            delete from leaf_snapshots
+            where corpus_id = ? and snapshot_kind = ? and scope_id like ? || '%'
+            """,
+            (corpus_id, snapshot_kind, scope_prefix),
+        )
+        return int(cur.rowcount or 0)
+
     def get_object(self, object_id: str) -> MemoryObjectRecord | None:
         row = self.conn.execute(
             "select * from leaf_objects where object_id = ?",
@@ -468,6 +488,66 @@ class SQLiteMemoryStore:
             (corpus_id, session_id),
         ).fetchall()
         return [self._row_to_object(row) for row in rows]
+
+    def get_events_for_object_ids(
+        self,
+        corpus_id: str,
+        object_ids: list[str],
+        limit: int | None = None,
+    ) -> list[MemoryEventRecord]:
+        normalized_ids = [str(object_id).strip() for object_id in object_ids if str(object_id).strip()]
+        if not normalized_ids:
+            return []
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        query = f"""
+            select distinct e.*
+            from leaf_events e
+            join leaf_evidence_links l on l.event_id = e.event_id and l.corpus_id = e.corpus_id
+            where e.corpus_id = ? and l.object_id in ({placeholders})
+            order by e.session_id, e.turn_index desc
+        """
+        params: list[object] = [corpus_id, *normalized_ids]
+        if limit is not None:
+            query += " limit ?"
+            params.append(limit)
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        events = [self._row_to_event(row) for row in rows]
+        events.reverse()
+        return events
+
+    def get_events_for_raw_span_ids(
+        self,
+        corpus_id: str,
+        raw_span_ids: list[str],
+    ) -> list[MemoryEventRecord]:
+        normalized_ids = [str(raw_span_id).strip() for raw_span_id in raw_span_ids if str(raw_span_id).strip()]
+        if not normalized_ids:
+            return []
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        rows = self.conn.execute(
+            f"""
+            select *
+            from leaf_events
+            where corpus_id = ? and raw_span_id in ({placeholders})
+            order by session_id, turn_index
+            """,
+            (corpus_id, *normalized_ids),
+        ).fetchall()
+        return [self._row_to_event(row) for row in rows]
+
+    def list_subject_event_ids(self, corpus_id: str) -> list[tuple[str, str]]:
+        rows = self.conn.execute(
+            """
+            select distinct o.subject, e.event_id, e.session_id, e.turn_index
+            from leaf_evidence_links l
+            join leaf_objects o on o.object_id = l.object_id and o.corpus_id = l.corpus_id
+            join leaf_events e on e.event_id = l.event_id and e.corpus_id = l.corpus_id
+            where l.corpus_id = ?
+            order by o.subject, e.session_id, e.turn_index
+            """,
+            (corpus_id,),
+        ).fetchall()
+        return [(str(row["subject"]), str(row["event_id"])) for row in rows]
 
     def list_subjects(self, corpus_id: str) -> list[str]:
         rows = self.conn.execute(

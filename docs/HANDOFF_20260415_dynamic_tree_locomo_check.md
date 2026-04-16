@@ -8,6 +8,52 @@ This note records the `LEAF` repository `dynamic-tree` branch LoCoMo QA run comp
 - preserve the final run paths and the added QA-time logging outputs
 
 
+## Execution Environment
+
+Use this Python interpreter for LEAF experiments and maintenance scripts in this workspace:
+
+- `/vepfs-mlp2/c20250513/241404044/users/roytian/anaconda3/bin/python`
+
+Practical note:
+
+- do not assume shell default `python3` is the right environment; during follow-up work on 2026-04-16 it was missing `PyYAML`, while the `anaconda3` interpreter worked
+- do not assume `sqlite3` CLI exists in the default shell either; if needed, inspect SQLite DBs with Python via the same interpreter above
+
+
+## Retrieval Smoke / Pilot Anchor
+
+As of 2026-04-16, the default retrieval smoke / pilot set is:
+
+- `conv-26`, first `35` questions
+- `conv-42`, first `35` questions
+- `conv-50`, first `35` questions
+
+Frozen input subset:
+
+- `LEAF/tmp/locomo_smoke_pilot_conv26_42_50_q35_20260416.json`
+
+Retrieval-only probe script:
+
+- `LEAF/scripts/probe_locomo_retrieval.py`
+
+Current anchor report on `LEAF/data/locomo10_dynamic_tree_mergeatom_yaketag_official_20260415.sqlite3` with `snapshot_limit=6`, `raw_span_limit=8`:
+
+- `LEAF/reports/locomo_smoke_pilot_conv26_42_50_q35_retrieval_20260416.json`
+
+Current anchor summary:
+
+- question count: `105`
+- missed_in_retrieval: `24`
+- avg search latency: `245.39 ms`
+- median search latency: `195.07 ms`
+
+By sample:
+
+- `conv-26`: `3 / 35`
+- `conv-42`: `11 / 35`
+- `conv-50`: `10 / 35`
+
+
 ## Bottom Line
 
 The `dynamic-tree` branch does **not** appear to use benchmark labels such as:

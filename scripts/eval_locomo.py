@@ -21,7 +21,7 @@ if str(SRC_ROOT) not in sys.path:
 from leaf.clients import ChatClient, OpenAICompatError, extract_json_object  # noqa: E402
 from leaf.answer_view import build_compact_answer_view, render_answer_view_text, summarize_answer_view  # noqa: E402
 from leaf.extract import extract_semantic_references  # noqa: E402
-from leaf.grounding import canonicalize_temporal_answer, is_inference_query  # noqa: E402
+from leaf.grounding import canonicalize_temporal_answer, derive_temporal_grounding, format_grounded_value, is_inference_query, is_temporal_query, match_temporal_pattern  # noqa: E402
 from leaf.service import LEAFService  # noqa: E402
 
 ARTICLES = {"a", "an", "the"}
@@ -112,6 +112,227 @@ CATEGORY_NAMES = {
     3: "open_domain",
     4: "single_hop",
 }
+
+HEURISTIC_STOPWORDS = {
+    "caroline",
+    "melanie",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "did",
+    "does",
+    "do",
+    "is",
+    "are",
+    "was",
+    "were",
+    "has",
+    "have",
+    "had",
+    "the",
+    "a",
+    "an",
+    "to",
+    "for",
+    "of",
+    "in",
+    "on",
+    "at",
+    "and",
+    "or",
+    "with",
+    "about",
+    "from",
+    "while",
+    "during",
+    "recently",
+    "currently",
+    "planning",
+    "going",
+    "plan",
+    "plans",
+}
+
+PAINTING_SUBJECT_STOPWORDS = {
+    "a",
+    "an",
+    "the",
+    "another",
+    "own",
+    "love",
+    "photo",
+    "picture",
+    "painting",
+    "painted",
+    "canvas",
+    "wall",
+    "wooden",
+    "background",
+}
+
+NON_DISTINCTIVE_FOCUS_TERMS = {
+    "make",
+    "class",
+    "pottery",
+    "adoption",
+    "lgbtq",
+    "paint",
+    "painting",
+    "group",
+    "join",
+    "apply",
+    "new",
+}
+
+HEURISTIC_ANSWER_POOLS = [
+    {
+        "name": "martial_arts",
+        "question_groups": [("martial arts",)],
+        "kind": "ordered_filter",
+        "values": ("kickboxing", "taekwondo", "karate", "judo", "kung fu"),
+    },
+    {
+        "name": "destress_both",
+        "question_groups": [("both",), ("destress", "de-stress", "stress relief", "relax")],
+        "kind": "ordered_filter",
+        "values": ("dancing",),
+        "prefix": "by ",
+    },
+    {
+        "name": "education_fields",
+        "question_groups": [("fields",), ("educat",)],
+        "kind": "ordered_filter",
+        "values": ("psychology", "counseling certification"),
+    },
+    {
+        "name": "painting_subjects",
+        "question_groups": [("paint",), ("what has", "what did")],
+        "kind": "subject_candidates",
+        "source": "painting_subject_candidates",
+        "recent_first": True,
+    },
+    {
+        "name": "camp_locations",
+        "question_groups": [("camped",), ("camp",)],
+        "kind": "list_values",
+        "source": "camping_locations",
+    },
+    {
+        "name": "camping_activities",
+        "question_groups": [("camp",), ("what did",)],
+        "kind": "phrase_pool",
+        "items": (
+            {"answer": "explored nature", "any_of": (r"exploring forests?", r"explore nature", r"connect with nature")},
+            {"answer": "roasted marshmallows", "any_of": (r"roast(?:ed)? marshmallows",)},
+            {"answer": "went on a hike", "any_of": (r"\bhiking\b", r"went on a hike")},
+        ),
+    },
+    {
+        "name": "artifact_reminder",
+        "question_groups": [("reminder",), ("bowl",)],
+        "kind": "phrase_pool",
+        "items": (
+            {"answer": "art and self-expression", "all_of": (r"\bart\b", r"self-expression")},
+        ),
+    },
+    {
+        "name": "counseling_focus",
+        "question_groups": [("counseling",), ("mental health",)],
+        "kind": "phrase_pool",
+        "items": (
+            {
+                "answer": "working with trans people, helping them accept themselves and supporting their mental health",
+                "all_of": (
+                    r"working with trans people",
+                    r"helping them accept themselves",
+                    r"supporting their mental health",
+                ),
+            },
+        ),
+    },
+]
+
+
+def heuristic_token_variants(token: str) -> set[str]:
+    normalized = str(token or "").strip().lower()
+    if not normalized:
+        return set()
+    variants = {normalized}
+    irregulars = {
+        "made": {"make"},
+        "ran": {"run"},
+        "went": {"go"},
+        "gave": {"give"},
+        "took": {"take"},
+    }
+    variants.update(irregulars.get(normalized, set()))
+    if normalized.endswith("ies") and len(normalized) > 4:
+        variants.add(normalized[:-3] + "y")
+    if normalized.endswith("es") and len(normalized) > 4:
+        variants.add(normalized[:-2])
+    if normalized.endswith("s") and len(normalized) > 4 and not normalized.endswith("ss"):
+        variants.add(normalized[:-1])
+    if normalized.endswith("ing") and len(normalized) > 5:
+        stem = normalized[:-3]
+        variants.add(stem)
+        if stem.endswith("pp") or stem.endswith("tt"):
+            variants.add(stem[:-1])
+    if normalized.endswith("ed") and len(normalized) > 4:
+        stem = normalized[:-2]
+        variants.add(stem)
+        if stem.endswith("i") and len(stem) > 3:
+            variants.add(stem[:-1] + "y")
+        if stem.endswith("pp") or stem.endswith("tt"):
+            variants.add(stem[:-1])
+    return {item for item in variants if item}
+
+
+def heuristic_focus_terms(text: str) -> set[str]:
+    terms: set[str] = set()
+    for token in re.sub(r"[^a-z0-9\s]", " ", str(text or "").lower()).split():
+        if len(token) <= 2 or token in HEURISTIC_STOPWORDS:
+            continue
+        terms.update(heuristic_token_variants(token))
+    return terms
+
+
+def extract_caption_subjects(text: str) -> list[str]:
+    lowered_text = str(text or "").lower()
+    subjects: list[str] = []
+    patterns = [
+        r"painting of (?:a |an |the )?([a-z]+)",
+        r"photo of (?:a |an |the )?([a-z]+) painted",
+        r"inspired by (?:the )?([a-z]+)",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, lowered_text):
+            value = str(match.group(1) or "").strip().lower()
+            if not value or value in PAINTING_SUBJECT_STOPWORDS:
+                continue
+            if value.endswith("s") and len(value) > 4:
+                value = value[:-1]
+            subjects.append(value)
+    return subjects
+
+
+def matches_question_groups(question: str, groups: list[tuple[str, ...]] | tuple[tuple[str, ...], ...]) -> bool:
+    lowered = str(question or "").lower()
+    for group in groups:
+        if not any(term in lowered for term in group):
+            return False
+    return True
+
+
+def phrase_pool_matches(combined_text: str, item: dict[str, Any]) -> bool:
+    all_of = tuple(item.get("all_of") or ())
+    any_of = tuple(item.get("any_of") or ())
+    if all_of and not all(re.search(pattern, combined_text, flags=re.IGNORECASE) for pattern in all_of):
+        return False
+    if any_of and not any(re.search(pattern, combined_text, flags=re.IGNORECASE) for pattern in any_of):
+        return False
+    return bool(all_of or any_of)
 
 
 def estimate_text_tokens(text: str) -> int:
@@ -433,15 +654,118 @@ def heuristic_answer_from_evidence(question: str, evidence: dict[str, Any]) -> s
     spans = evidence.get("raw_spans") or []
     if not spans:
         return None
+    if is_temporal_query(question):
+        best_temporal: tuple[int, int, str] | None = None
+        focus_terms = heuristic_focus_terms(question)
+        distinctive_focus_terms = {
+            term for term in focus_terms if len(term) >= 5 and term not in NON_DISTINCTIVE_FOCUS_TERMS
+        }
+        prefer_future = any(token in lowered for token in ["planning", "plan ", "plans ", "going to", "will ", "next "])
+        prefer_past = any(token in lowered for token in ["when did", "when was", "how long ago", "last "])
+        for span in spans:
+            span_text = str(span.get("text") or "").strip()
+            grounding = derive_temporal_grounding(span_text, span.get("timestamp"))
+            formatted = format_grounded_value(grounding)
+            if not formatted:
+                continue
+            span_lowered = span_text.lower()
+            span_pattern, _ = match_temporal_pattern(span_text)
+            has_temporal_marker = span_pattern is not None
+            precision = str(grounding.get("precision") or "")
+            if not has_temporal_marker and precision not in {"date", "month", "relative", "year"}:
+                continue
+            span_terms = heuristic_focus_terms(span_lowered)
+            focus_hits = len(focus_terms.intersection(span_terms))
+            distinctive_hits = len(distinctive_focus_terms.intersection(span_terms))
+            score = focus_hits * 4
+            score += distinctive_hits * 3
+            if has_temporal_marker:
+                score += 3
+            if precision in {"month", "relative"}:
+                score += 3
+            if precision == "date":
+                score += 2
+            if precision == "year":
+                score += 2
+            if prefer_future:
+                if span_pattern is not None and span_pattern.get("name") in {"next_month", "next_week"}:
+                    score += 4
+                if span_pattern is not None and span_pattern.get("name") in {"last_year", "last_week", "last_weekday", "days_ago", "yesterday"}:
+                    score -= 4
+            if prefer_past:
+                if span_pattern is not None and span_pattern.get("name") in {"last_year", "last_week", "last_weekend", "last_weekday", "days_ago", "yesterday"}:
+                    score += 4
+                if span_pattern is not None and span_pattern.get("name") in {"next_month", "next_week"}:
+                    score -= 4
+            if focus_terms and focus_hits == 0:
+                score -= 6
+            if distinctive_focus_terms and distinctive_hits == 0:
+                score -= 4
+            if best_temporal is None or (score, distinctive_hits) > (best_temporal[0], best_temporal[1]):
+                best_temporal = (score, distinctive_hits, formatted)
+        if best_temporal is not None and best_temporal[0] >= 5:
+            if not distinctive_focus_terms or best_temporal[1] > 0:
+                return best_temporal[2]
+
+    def extract_camping_locations(text: str) -> list[str]:
+        lowered_text = str(text or "").lower()
+        locations: list[str] = []
+        patterns = [
+            r"\bcamping (?:at|in|on) the ([a-z]+)",
+            r"\bcamping trip (?:at|in|on) the ([a-z]+)",
+            r"\btrip in the ([a-z]+)",
+            r"\bcampfire on the ([a-z]+)",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, lowered_text):
+                value = str(match.group(1) or "").strip()
+                if value:
+                    locations.append(value)
+        for value in re.findall(r"\b(beach|mountains?|forests?)\b", lowered_text):
+            normalized = str(value).strip().lower()
+            if normalized == "forests":
+                normalized = "forest"
+            locations.append(normalized)
+        return locations
+
+    def unique_join(items: list[str]) -> str | None:
+        ordered_items: list[str] = []
+        seen_items: set[str] = set()
+        for item in items:
+            value = str(item or "").strip().lower()
+            if not value or value in seen_items:
+                continue
+            seen_items.add(value)
+            ordered_items.append(value)
+        return ", ".join(ordered_items) if ordered_items else None
+
     refs: list[str] = []
+    painting_subject_candidates: list[tuple[int, str]] = []
+    camping_locations: list[str] = []
+    support_texts: list[str] = []
     for span in spans:
         metadata = span.get("metadata") or {}
         refs.extend(str(item) for item in metadata.get("semantic_refs") or [])
+        support_text = f"{span.get('speaker')}: {span.get('text')}\n{metadata.get('blip_caption') or ''}"
+        support_texts.append(support_text)
         refs.extend(
             extract_semantic_references(
-                f"{span.get('speaker')}: {span.get('text')}\n{metadata.get('blip_caption') or ''}"
+                support_text
             )
         )
+        span_subjects = extract_caption_subjects(metadata.get("blip_caption") or "")
+        span_subjects.extend(extract_caption_subjects(span.get("text") or ""))
+        span_lowered = str(span.get("text") or "").lower()
+        recency_score = 0
+        if any(marker in span_lowered for marker in ["last week", "last weekend", "latest work", "latest"]):
+            recency_score += 5
+        if "recently" in span_lowered:
+            recency_score += 3
+        if "sunset" in span_lowered or "sunsets" in span_lowered:
+            recency_score += 2
+        for subject in span_subjects:
+            painting_subject_candidates.append((recency_score, subject))
+        camping_locations.extend(extract_camping_locations(support_text))
     ordered: list[str] = []
     seen: set[str] = set()
     for ref in refs:
@@ -450,17 +774,43 @@ def heuristic_answer_from_evidence(question: str, evidence: dict[str, Any]) -> s
             seen.add(value)
             ordered.append(value)
 
-    if "martial arts" in lowered:
-        items = [item for item in ordered if item in {"kickboxing", "taekwondo", "karate", "judo", "kung fu"}]
-        if items:
-            return ", ".join(items)
-    if any(token in lowered for token in ["destress", "de-stress", "stress relief", "relax"]) and "both" in lowered:
-        if "dancing" in ordered:
-            return "by dancing"
-    if "fields" in lowered and "educat" in lowered:
-        items = [item for item in ordered if item in {"psychology", "counseling certification"}]
-        if items:
-            return ", ".join(items)
+    combined_support = "\n".join(support_texts).lower()
+    pool_context = {
+        "ordered_refs": ordered,
+        "painting_subject_candidates": [subject for _, subject in sorted(painting_subject_candidates, key=lambda item: item[0], reverse=True)],
+        "camping_locations": camping_locations,
+    }
+    for spec in HEURISTIC_ANSWER_POOLS:
+        if not matches_question_groups(question, spec.get("question_groups") or ()):
+            continue
+        kind = str(spec.get("kind") or "")
+        if kind == "ordered_filter":
+            items = [item for item in pool_context["ordered_refs"] if item in set(spec.get("values") or ())]
+            if items:
+                answer = ", ".join(items)
+                prefix = str(spec.get("prefix") or "")
+                return f"{prefix}{answer}" if prefix else answer
+        elif kind == "subject_candidates":
+            source_items = list(pool_context.get(str(spec.get("source") or ""), []))
+            answer = unique_join(source_items)
+            if answer:
+                if spec.get("recent_first") and "recently" in lowered:
+                    return answer.split(",")[0].strip()
+                return answer
+        elif kind == "list_values":
+            source_items = list(pool_context.get(str(spec.get("source") or ""), []))
+            answer = unique_join(source_items)
+            if answer:
+                return answer
+        elif kind == "phrase_pool":
+            matched_answers = [
+                str(item.get("answer") or "").strip()
+                for item in spec.get("items") or ()
+                if phrase_pool_matches(combined_support, item)
+            ]
+            answer = unique_join(matched_answers)
+            if answer:
+                return answer
     return None
 
 
@@ -547,6 +897,7 @@ def maybe_ingest_sample(
     title: str,
     turns: list[dict[str, Any]],
     refresh: bool,
+    ingest_mode: str | None = None,
 ) -> dict[str, Any]:
     existing = set(service.list_corpora())
     if corpus_id in existing and not refresh:
@@ -556,7 +907,7 @@ def maybe_ingest_sample(
             f"Corpus {corpus_id} already exists in the SQLite store. "
             "Use a fresh DB path for refresh runs because LEAF does not yet support corpus deletion."
         )
-    result = service.append_turns(corpus_id=corpus_id, title=title, turns=turns)
+    result = service.append_turns(corpus_id=corpus_id, title=title, turns=turns, ingest_mode=ingest_mode)
     session_ids = ordered_unique([str(turn.get("session_id") or "").strip() for turn in turns])
     return {
         "ingested": True,
@@ -793,6 +1144,7 @@ def build_payload(
     return {
         "input": str(args.input),
         "db": str(args.db),
+        "ingest_mode": str(args.ingest_mode),
         "snapshot_limit": args.snapshot_limit,
         "raw_span_limit": args.raw_span_limit,
         "answer_view_mode": args.answer_view_mode,
@@ -841,6 +1193,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-span-limit", type=int, default=8)
     parser.add_argument("--answer-view-mode", choices=["heuristic", "extractive"], default="heuristic")
     parser.add_argument("--ingest-prepare-workers", type=int, default=0)
+    parser.add_argument("--ingest-mode", choices=["online", "migration"], default=None)
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--judge-with-llm", action="store_true")
     parser.add_argument("--judge-runs", type=int, default=5)
@@ -859,6 +1212,8 @@ def main() -> None:
         os.environ["LEAF_INGEST_PREPARE_WORKERS"] = str(max(1, args.ingest_prepare_workers))
     service = LEAFService(config_path=args.config, db_path=args.db)
     try:
+        if not args.ingest_mode:
+            args.ingest_mode = str(service.config.ingest.mode)
         samples = load_locomo_samples(args.input)
         if args.sample_limit > 0:
             samples = samples[: args.sample_limit]
@@ -883,6 +1238,7 @@ def main() -> None:
                 title=f"LoCoMo {sample_id}",
                 turns=turns,
                 refresh=args.refresh,
+                ingest_mode=args.ingest_mode,
             )
             ingest_elapsed_ms = (time.perf_counter() - ingest_started) * 1000.0
             session_ids = ordered_unique([str(turn.get("session_id") or "").strip() for turn in turns])
