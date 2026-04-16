@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", required=True)
     parser.add_argument("--input-report", required=True)
     parser.add_argument("--output-report", required=True)
+    parser.add_argument("--judge-style", choices=["legacy_binary", "partial_credit"], default="legacy_binary")
     parser.add_argument("--judge-runs", type=int, default=5)
     parser.add_argument("--judge-retries", type=int, default=3)
     parser.add_argument("--judge-max-workers", type=int, default=4)
@@ -102,6 +103,7 @@ def main() -> None:
                 gold_answer=str(row["gold_answer"]),
                 predicted_answer=str(row["predicted_answer"]),
                 retries=args.judge_retries,
+                judge_style=args.judge_style,
             )
             for _ in range(max(1, args.judge_runs))
         ]
@@ -146,6 +148,7 @@ def main() -> None:
     updated_payload = dict(payload)
     updated_payload["source_report"] = str(input_path)
     updated_payload["judge_with_llm"] = True
+    updated_payload["judge_style"] = str(args.judge_style)
     updated_payload["judge_runs"] = int(args.judge_runs)
     updated_payload["judge_max_workers"] = int(worker_count)
     updated_payload["judge_retries"] = int(args.judge_retries)

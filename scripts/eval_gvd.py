@@ -160,6 +160,21 @@ TITLE_HINT_PATTERNS = (
     "who",
 )
 
+EXACT_SHORT_HINT_PATTERNS = (
+    "what was its name",
+    "what is its name",
+    "what movie",
+    "what novel",
+    "what book",
+    "what film",
+    "what song",
+    "what exhibition",
+    "what attraction",
+    "what city",
+    "what is my favorite",
+    "what's my favorite",
+)
+
 
 def estimate_text_tokens(text: str) -> int:
     stripped = str(text or "")
@@ -224,6 +239,37 @@ def is_yes_no_query(question: str) -> bool:
     return bool(lowered) and (lowered.startswith(YES_NO_PREFIXES) or lowered.endswith("right?") or ", right?" in lowered)
 
 
+def use_exact_short_mode(question: str) -> bool:
+    lowered = str(question or "").strip().lower()
+    if not lowered or is_inference_query(question) or is_list_query(question):
+        return False
+    if any(
+        token in lowered
+        for token in [
+            "recipe",
+            "advice",
+            "suggestions",
+            "methods",
+            "what were",
+            "what problems",
+            "what issues",
+            "what topics",
+            "content",
+            "what did i do",
+            "why was",
+            "what inspired",
+            "which books",
+            "what books",
+            "how am i feeling",
+            "living a healthy life",
+        ]
+    ):
+        return False
+    if is_yes_no_query(question):
+        return True
+    return any(pattern in lowered for pattern in EXACT_SHORT_HINT_PATTERNS)
+
+
 def answer_query_terms(question: str) -> set[str]:
     tokens = {
         token
@@ -262,6 +308,160 @@ def score_context_line(question: str, line: str) -> float:
     if "problem" in lowered_question and "problem" in lowered_line:
         score += 0.15
     return score
+
+
+def normalize_context_text(text: str) -> str:
+    return " ".join(str(text or "").strip().split())
+
+
+def dedupe_preserve_order(lines: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for line in lines:
+        compact = normalize_context_text(line)
+        if not compact:
+            continue
+        key = compact.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(compact)
+    return ordered
+
+
+def extract_answer_view_lines(answer_view: dict[str, Any], key: str) -> list[str]:
+    items = answer_view.get(key) or []
+    if not isinstance(items, list):
+        items = [items]
+    lines: list[str] = []
+    for item in items:
+        text = str(item.get("text") or "").strip() if isinstance(item, dict) else str(item or "").strip()
+        compact = normalize_context_text(text)
+        if compact:
+            lines.append(compact)
+    return dedupe_preserve_order(lines)
+
+
+def line_date_token(line: str) -> str | None:
+    text = str(line or "")
+    match = re.search(r"\b(20\d{2})-(\d{2})-(\d{2})\b", text)
+    if not match:
+        return None
+    return f"{match.group(2)}-{match.group(3)}"
+
+
+def line_supports_exact_answer(question: str, line: str) -> bool:
+    lowered_question = str(question or "").strip().lower()
+    lowered_line = str(line or "").strip().lower()
+    if not lowered_line:
+        return False
+    if is_yes_no_query(question):
+        polarity_markers = [
+            " like ",
+            " likes ",
+            " don't like",
+            " doesn't like",
+            "love",
+            "loved",
+            "favorite",
+            "prefer",
+            "preferred",
+            "enjoy",
+            "enjoyed",
+            "dislike",
+            "hate",
+        ]
+        return any(marker in f" {lowered_line} " for marker in polarity_markers)
+    if any(pattern in lowered_question for pattern in TITLE_HINT_PATTERNS):
+        if '"' in line or "'" in line:
+            return True
+        if re.search(r"\b[A-Z][A-Za-z0-9'&-]+(?:\s+[A-Z][A-Za-z0-9'&-]+){0,6}\b", str(line or "")):
+            return True
+    if any(token in lowered_question for token in ["favorite", "problem", "issue", "inspired", "why", "what did i do"]):
+        salient_markers = [
+            "favorite",
+            "problem",
+            "issue",
+            "difficulty",
+            "struggling",
+            "inspired",
+            "because",
+            "due to",
+            "asked",
+            "went",
+            "read",
+            "watched",
+            "liked",
+            "loved",
+        ]
+        return any(marker in lowered_line for marker in salient_markers)
+    return score_context_line(question, line) >= 0.6
+
+
+def select_short_answer_context(
+    question: str,
+    *,
+    evidence: dict[str, Any],
+    answer_view: dict[str, Any],
+    context_lines: list[str],
+) -> tuple[str, dict[str, Any]]:
+    single_fact_query = is_single_fact_query(question)
+    yes_no_query = is_yes_no_query(question)
+    list_query = is_list_query(question)
+    explicit_date = has_explicit_date(question)
+    inference_mode = is_inference_query(question)
+    month_day = target_month_day(question)
+
+    direct_lines = extract_answer_view_lines(answer_view, "direct_evidence")
+    if not direct_lines:
+        direct_lines = context_lines
+    direct_lines = filter_context_lines_for_question(question, direct_lines)
+    if explicit_date and month_day is not None:
+        dated = [line for line in direct_lines if line_date_token(line) == month_day]
+        if dated:
+            direct_lines = dated
+    direct_scored = [
+        (score_context_line(question, line), index, normalize_context_text(line))
+        for index, line in enumerate(direct_lines)
+        if normalize_context_text(line)
+    ]
+    direct_scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+    top_direct_score = direct_scored[0][0] if direct_scored else 0.0
+    dominant_session = extract_session_id_from_context_line(direct_scored[0][2]) if direct_scored else None
+    if dominant_session and not inference_mode and (single_fact_query or yes_no_query or list_query):
+        same_session = [item for item in direct_scored if extract_session_id_from_context_line(item[2]) == dominant_session]
+        if len(same_session) >= 2 or (same_session and top_direct_score >= 0.45):
+            direct_scored = same_session
+    max_direct = 3 if (single_fact_query or yes_no_query) else 4 if list_query else 4
+    selected_direct = [item[2] for item in direct_scored[:max_direct]]
+
+    support_lines: list[str] = []
+    if list_query or inference_mode or any(token in str(question or "").lower() for token in ["why", "problem", "issue", "inspired", "what did i do"]):
+        support_lines.extend(extract_answer_view_lines(answer_view, "entity_facts")[:2])
+    if explicit_date:
+        support_lines.extend(extract_answer_view_lines(answer_view, "temporal_clues")[:1])
+    support_lines = [line for line in dedupe_preserve_order(support_lines) if line not in selected_direct]
+
+    if not selected_direct:
+        fallback_lines, fallback_score = prioritize_answer_context(question, context_lines)
+        selected_direct = fallback_lines[:max_direct]
+        top_direct_score = max(top_direct_score, fallback_score)
+
+    selected_direct = dedupe_preserve_order(selected_direct)
+    has_concrete_direct_clue = any(line_supports_exact_answer(question, line) for line in selected_direct)
+
+    rendered: list[str] = ["[Direct Evidence]"]
+    rendered.extend(f"- {line}" for line in selected_direct)
+    if support_lines:
+        rendered.extend(["", "[Supporting Facts]"])
+        rendered.extend(f"- {line}" for line in support_lines)
+    return "\n".join(rendered).strip(), {
+        "top_direct_score": round(top_direct_score, 4),
+        "direct_count": len(selected_direct),
+        "support_count": len(support_lines),
+        "has_concrete_direct_clue": has_concrete_direct_clue,
+        "dominant_session": dominant_session,
+    }
 
 
 def prioritize_answer_context(question: str, context_lines: list[str]) -> tuple[list[str], float]:
@@ -449,13 +649,22 @@ def build_answer_messages(
     answer_style: str = "short",
     context_lines: list[str] | None = None,
     answer_view_text: str | None = None,
+    answer_view: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     context_lines = context_lines if context_lines is not None else build_answer_context_lines(evidence)
+    exact_short_mode = answer_style == "short" and use_exact_short_mode(question)
     single_fact_query = is_single_fact_query(question)
     explicit_date = has_explicit_date(question)
     yes_no_query = is_yes_no_query(question)
     inference_mode = is_inference_query(question)
     month_day = target_month_day(question)
+    support_profile = {
+        "top_direct_score": 0.0,
+        "direct_count": 0,
+        "support_count": 0,
+        "has_concrete_direct_clue": False,
+        "dominant_session": None,
+    }
     if explicit_date and month_day is not None:
         same_day_lines = [line for line in context_lines if f"-{month_day}" in line]
         if same_day_lines:
@@ -466,6 +675,14 @@ def build_answer_messages(
         if prioritized_lines:
             context_lines = prioritized_lines
         context = answer_view_text if answer_view_text is not None else "\n".join(context_lines).strip()
+    elif exact_short_mode:
+        context, support_profile = select_short_answer_context(
+            question,
+            evidence=evidence,
+            answer_view=answer_view or {},
+            context_lines=context_lines,
+        )
+        top_support_score = float(support_profile.get("top_direct_score") or 0.0)
     else:
         top_support_score = 0.0
         context = "\n".join(context_lines).strip()
@@ -495,6 +712,42 @@ def build_answer_messages(
             "Return only the shortest answer phrase, with no explanation or preamble.",
             "Do not invent or over-specify details that are not explicitly grounded by the evidence.",
         ]
+    elif exact_short_mode:
+        instruction_parts = [
+            "Answer the question using only the provided evidence.",
+            "Use Direct Evidence as the primary source.",
+            "Use Supporting Facts only to complete a missing detail, not to broaden the answer.",
+            "Respect the asked scope exactly and do not add nearby but different facts, plans, or examples.",
+            "If the evidence is insufficient, answer UNKNOWN.",
+            "Return only the shortest exact answer text with no explanation or preamble.",
+            "Keep the answer directly grounded.",
+        ]
+        if inference_mode:
+            instruction_parts.append(
+                "You may make a grounded inference only when the answer is clearly implied by multiple evidence lines."
+            )
+        if list_query := is_list_query(question):
+            instruction_parts.append(
+                "For list questions, include only items explicitly supported by Direct Evidence and do not add related extras."
+            )
+        if yes_no_query:
+            instruction_parts.append(
+                "For confirmation questions, answer with a direct Yes or No first, then only the shortest supporting phrase if needed."
+            )
+            instruction_parts.append(
+                "Evaluate whether the proposition in the question is true or false based on the evidence, and do not merely repeat the question's wording."
+            )
+            instruction_parts.append(
+                "If the correct answer is No, state the corrected fact briefly instead of repeating the false negative wording from the question."
+            )
+        if support_profile.get("has_concrete_direct_clue"):
+            instruction_parts.append(
+                "The evidence already contains a concrete direct clue. Extract it and do not answer UNKNOWN."
+            )
+        if single_fact_query and top_support_score >= 0.55:
+            instruction_parts.append(
+                "This is an exact single-fact question. Prefer the most specific directly stated value over a vague summary."
+            )
     else:
         instruction_parts = [
             "Answer the question using only the provided evidence.",
@@ -545,6 +798,38 @@ def build_answer_messages(
             "content": (
                 f"Question: {question}\n\n"
                 f"Retrieved memory evidence:\n{context}\n\n"
+                "Return only the answer text."
+            ),
+        },
+    ]
+
+
+def build_unknown_recovery_messages(
+    question: str,
+    *,
+    focused_context: str,
+    yes_no_query: bool,
+    list_query: bool,
+) -> list[dict[str, str]]:
+    instruction_parts = [
+        "Extract the answer from the provided direct evidence only.",
+        "A concrete clue is already present in the evidence, so do not answer UNKNOWN.",
+        "Return only the shortest exact answer text.",
+        "Do not explain.",
+    ]
+    if yes_no_query:
+        instruction_parts.append("For confirmation questions, answer with Yes or No first, then only the shortest support phrase if needed.")
+        instruction_parts.append("Judge whether the question's proposition is true or false from the evidence, and do not mirror the question's negation.")
+        instruction_parts.append("If the answer is No, briefly state the corrected fact rather than repeating the false wording from the question.")
+    if list_query:
+        instruction_parts.append("For list questions, include only the items directly stated in the evidence and nothing extra.")
+    return [
+        {"role": "system", "content": " ".join(instruction_parts)},
+        {
+            "role": "user",
+            "content": (
+                f"Question: {question}\n\n"
+                f"Focused evidence:\n{focused_context}\n\n"
                 "Return only the answer text."
             ),
         },
@@ -632,6 +917,7 @@ def maybe_ingest_persona(
     turns: list[dict[str, Any]],
     *,
     refresh: bool,
+    ingest_mode: str | None = None,
 ) -> dict[str, Any]:
     existing = set(service.list_corpora())
     if corpus_id in existing and not refresh:
@@ -641,7 +927,7 @@ def maybe_ingest_persona(
             f"Corpus {corpus_id} already exists in the SQLite store. "
             "Use a fresh DB path for refresh runs because LEAF does not yet support corpus deletion."
         )
-    result = service.append_turns(corpus_id=corpus_id, title=title, turns=turns)
+    result = service.append_turns(corpus_id=corpus_id, title=title, turns=turns, ingest_mode=ingest_mode)
     return {"ingested": True, "reused": False, "turn_count": len(turns), "result": result}
 
 
@@ -665,6 +951,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--question-limit", type=int, default=0)
     parser.add_argument("--snapshot-limit", type=int, default=6)
     parser.add_argument("--raw-span-limit", type=int, default=8)
+    parser.add_argument("--ingest-mode", choices=["online", "migration"], default=None)
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--judge-with-llm", action="store_true")
     parser.add_argument(
@@ -679,6 +966,12 @@ def parse_args() -> argparse.Namespace:
         default="none",
         help="Optional second-pass answer revision over the same retrieved evidence.",
     )
+    parser.add_argument(
+        "--unknown-recovery",
+        choices=["none", "direct_clue"],
+        default="none",
+        help="Optional second-pass recovery when the first answer is UNKNOWN despite a strong direct clue.",
+    )
     return parser.parse_args()
 
 
@@ -687,6 +980,8 @@ def main() -> None:
     service = LEAFService(config_path=args.config, db_path=args.db)
     judge_client = ChatClient(service.config.llm) if args.judge_with_llm and service.config.llm.base_url else None
     try:
+        if not args.ingest_mode:
+            args.ingest_mode = str(service.config.ingest.mode)
         bank = load_memory_bank(args.memory_bank)
         questions = load_questions(args.questions)
         persona_names = [name for name in bank.keys() if str(name).strip() in questions]
@@ -714,6 +1009,7 @@ def main() -> None:
                 title=f"GVD Persona {normalized_name}",
                 turns=turns,
                 refresh=args.refresh,
+                ingest_mode=args.ingest_mode,
             )
             ingest_elapsed_ms = (time.perf_counter() - ingest_started) * 1000.0
             ingest_rows.append(
@@ -751,12 +1047,50 @@ def main() -> None:
                     answer_style=args.answer_style,
                     context_lines=context_lines,
                     answer_view_text=answer_view_text,
+                    answer_view=answer_view,
                 )
                 answer_input_tokens_est = estimate_message_tokens(answer_messages)
                 answer_started = time.perf_counter()
+                unknown_recovery_triggered = False
+                unknown_recovery_used = False
+                answer_llm_call_count = 0
                 try:
                     answer_max_tokens = 96 if is_inference_query(question) else 80
                     predicted_answer = service.llm.text(answer_messages, max_tokens=answer_max_tokens, temperature=0.0).strip() if service.llm else ""
+                    if service.llm:
+                        answer_llm_call_count += 1
+                    if (
+                        args.unknown_recovery == "direct_clue"
+                        and
+                        args.answer_style == "short"
+                        and use_exact_short_mode(question)
+                        and service.llm
+                        and str(predicted_answer or "").strip().upper() == "UNKNOWN"
+                    ):
+                        focused_context, support_profile = select_short_answer_context(
+                            question,
+                            evidence=evidence,
+                            answer_view=answer_view,
+                            context_lines=context_lines,
+                        )
+                        if support_profile.get("has_concrete_direct_clue"):
+                            unknown_recovery_triggered = True
+                            recovery_messages = build_unknown_recovery_messages(
+                                question,
+                                focused_context=focused_context,
+                                yes_no_query=is_yes_no_query(question),
+                                list_query=is_list_query(question),
+                            )
+                            answer_input_tokens_est += estimate_message_tokens(recovery_messages)
+                            recovered_answer = service.llm.text(
+                                recovery_messages,
+                                max_tokens=answer_max_tokens,
+                                temperature=0.0,
+                            ).strip()
+                            answer_llm_call_count += 1
+                            if recovered_answer and not recovered_answer.startswith("__ERROR__:"):
+                                predicted_answer = recovered_answer
+                                unknown_recovery_used = True
                     if (
                         args.answer_revision == "grounded"
                         and service.llm
@@ -770,6 +1104,7 @@ def main() -> None:
                         )
                         answer_input_tokens_est += estimate_message_tokens(revision_messages)
                         revised_answer = service.llm.text(revision_messages, max_tokens=answer_max_tokens, temperature=0.0).strip()
+                        answer_llm_call_count += 1
                         if revised_answer:
                             predicted_answer = revised_answer
                 except OpenAICompatError as exc:
@@ -812,6 +1147,10 @@ def main() -> None:
                         "answer_input_tokens_est": answer_input_tokens_est,
                         "answer_style": args.answer_style,
                         "answer_revision": args.answer_revision,
+                        "unknown_recovery": args.unknown_recovery,
+                        "unknown_recovery_triggered": unknown_recovery_triggered,
+                        "unknown_recovery_used": unknown_recovery_used,
+                        "answer_llm_call_count": answer_llm_call_count,
                         "raw_span_count": len(evidence.get("raw_spans") or []),
                         "answer_context_line_count": len(context_lines),
                         "answer_view_summary": summarize_answer_view(answer_view),
@@ -834,6 +1173,16 @@ def main() -> None:
             for row in ingest_rows
             if isinstance(row.get("ingest_metrics"), dict)
         ]
+        ingest_llm_prompt_token_rows = [
+            dict(row.get("memory_llm_prompt_tokens_est") or {})
+            for row in ingest_metric_rows
+            if isinstance(row.get("memory_llm_prompt_tokens_est"), dict)
+        ]
+        ingest_llm_prompt_token_source_rows = [
+            dict(row.get("memory_llm_prompt_token_source") or {})
+            for row in ingest_metric_rows
+            if isinstance(row.get("memory_llm_prompt_token_source"), dict)
+        ]
         ingest_elapsed_values = [row["ingest_elapsed_ms"] for row in ingest_rows if row["ingest_elapsed_ms"] is not None]
 
         summary = {
@@ -844,6 +1193,10 @@ def main() -> None:
             "p50_answer_input_tokens_est": int(statistics.median(token_values)) if token_values else None,
             "judge_avg": round(sum(judge_values) / len(judge_values), 4) if judge_values else None,
             "judge_count": len(judge_values),
+            "unknown_recovery_mode": args.unknown_recovery,
+            "unknown_recovery_triggered_count": sum(1 for row in results if row.get("unknown_recovery_triggered")),
+            "unknown_recovery_used_count": sum(1 for row in results if row.get("unknown_recovery_used")),
+            "answer_llm_call_count_total": sum(int(row.get("answer_llm_call_count") or 0) for row in results),
             "ingest_reused_count": sum(1 for row in ingest_rows if row["reused"]),
             "ingest_new_count": sum(1 for row in ingest_rows if row["ingested"]),
             "ingest_avg_elapsed_ms": round(sum(ingest_elapsed_values) / len(ingest_elapsed_values), 2) if ingest_elapsed_values else None,
@@ -864,6 +1217,8 @@ def main() -> None:
                     if isinstance(row.get("memory_llm_calls_est"), dict)
                 ]
             ),
+            "ingest_memory_llm_prompt_tokens_est_total": add_numeric_maps(ingest_llm_prompt_token_rows),
+            "ingest_memory_llm_prompt_token_source_total": add_numeric_maps(ingest_llm_prompt_token_source_rows),
             "ingest_state_action_counts_total": add_numeric_maps(
                 [
                     dict(row.get("state_action_counts") or {})
@@ -884,6 +1239,7 @@ def main() -> None:
             "memory_bank": str(args.memory_bank),
             "questions": str(args.questions),
             "db": str(args.db),
+            "ingest_mode": str(args.ingest_mode),
             "snapshot_limit": args.snapshot_limit,
             "raw_span_limit": args.raw_span_limit,
             "personas": list(args.personas),
@@ -892,6 +1248,7 @@ def main() -> None:
             "judge_with_llm": args.judge_with_llm,
             "answer_style": args.answer_style,
             "answer_revision": args.answer_revision,
+            "unknown_recovery": args.unknown_recovery,
             "summary": summary,
             "ingest": ingest_rows,
             "results": results,

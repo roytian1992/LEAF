@@ -926,7 +926,25 @@ def add_numeric_maps(rows: list[dict[str, int]]) -> dict[str, int]:
     return dict(sorted(total.items()))
 
 
-def build_locomo_judge_messages(*, question: str, gold_answer: str, predicted_answer: str) -> list[dict[str, str]]:
+def build_locomo_judge_messages(
+    *,
+    question: str,
+    gold_answer: str,
+    predicted_answer: str,
+    judge_style: str = "legacy_binary",
+) -> list[dict[str, str]]:
+    if str(judge_style).strip().lower() == "legacy_binary":
+        legacy_prompt = (
+            "Your task is to label an answer to a question as CORRECT or WRONG.\n"
+            "You will be given a question, a gold answer, and a generated answer.\n"
+            "Be generous on wording when the generated answer matches the same fact or time period.\n"
+            "For time questions, treat equivalent absolute or relative forms as CORRECT if they refer to the same time.\n"
+            'Return only JSON with keys "label" and "reason".\n\n'
+            f"Question: {question}\n"
+            f"Gold answer: {gold_answer}\n"
+            f"Generated answer: {predicted_answer}\n"
+        )
+        return [{"role": "system", "content": legacy_prompt}]
     return [
         {
             "role": "system",
@@ -953,8 +971,18 @@ def build_locomo_judge_messages(*, question: str, gold_answer: str, predicted_an
     ]
 
 
-def judge_answer(client: ChatClient, *, question: str, gold_answer: str, predicted_answer: str, retries: int) -> dict[str, Any]:
+def judge_answer(
+    client: ChatClient,
+    *,
+    question: str,
+    gold_answer: str,
+    predicted_answer: str,
+    retries: int,
+    judge_style: str = "legacy_binary",
+) -> dict[str, Any]:
     last_error = None
+    resolved_style = str(judge_style).strip().lower() or "legacy_binary"
+    legacy_binary = resolved_style == "legacy_binary"
     for _ in range(max(1, retries)):
         try:
             payload = extract_json_object(
@@ -963,14 +991,20 @@ def judge_answer(client: ChatClient, *, question: str, gold_answer: str, predict
                         question=question,
                         gold_answer=gold_answer,
                         predicted_answer=predicted_answer,
+                        judge_style=resolved_style,
                     ),
                     max_tokens=256,
                     temperature=0.0,
                 ).strip()
             )
             label = str(payload.get("label") or "").strip().upper()
-            score = float(payload.get("score"))
-            if label not in {"CORRECT", "PARTIAL", "WRONG"}:
+            if legacy_binary:
+                if label not in {"CORRECT", "WRONG"}:
+                    raise ValueError(f"Unexpected label: {label}")
+                score = 1.0 if label == "CORRECT" else 0.0
+            else:
+                score = float(payload.get("score"))
+            if not legacy_binary and label not in {"CORRECT", "PARTIAL", "WRONG"}:
                 raise ValueError(f"Unexpected label: {label}")
             if score not in {0.0, 0.5, 1.0}:
                 raise ValueError(f"Unexpected score: {score}")
@@ -1072,6 +1106,16 @@ def build_summary(
         for row in ingest_rows
         if isinstance(row.get("ingest_metrics"), dict)
     ]
+    ingest_llm_prompt_token_rows = [
+        dict(row.get("memory_llm_prompt_tokens_est") or {})
+        for row in ingest_metric_rows
+        if isinstance(row.get("memory_llm_prompt_tokens_est"), dict)
+    ]
+    ingest_llm_prompt_token_source_rows = [
+        dict(row.get("memory_llm_prompt_token_source") or {})
+        for row in ingest_metric_rows
+        if isinstance(row.get("memory_llm_prompt_token_source"), dict)
+    ]
     ingest_elapsed_values = [float(row["ingest_elapsed_ms"]) for row in ingest_rows if row.get("ingest_elapsed_ms") is not None]
     judge_mean, judge_std, judge_run_scores = summarize_judge_runs(results)
 
@@ -1111,6 +1155,8 @@ def build_summary(
                 if isinstance(row.get("memory_llm_calls_est"), dict)
             ]
         ),
+        "ingest_memory_llm_prompt_tokens_est_total": add_numeric_maps(ingest_llm_prompt_token_rows),
+        "ingest_memory_llm_prompt_token_source_total": add_numeric_maps(ingest_llm_prompt_token_source_rows),
         "ingest_state_action_counts_total": add_numeric_maps(
             [
                 dict(row.get("state_action_counts") or {})
@@ -1152,6 +1198,7 @@ def build_payload(
         "sample_limit": args.sample_limit,
         "qa_per_sample": args.qa_per_sample,
         "judge_with_llm": args.judge_with_llm,
+        "judge_style": str(args.judge_style) if args.judge_with_llm else None,
         "judge_runs": args.judge_runs if args.judge_with_llm else 0,
         "completed": completed,
         "qa_progress_path": str(qa_progress_path) if qa_progress_path is not None else None,
@@ -1196,9 +1243,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ingest-mode", choices=["online", "migration"], default=None)
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--judge-with-llm", action="store_true")
+    parser.add_argument("--judge-style", choices=["legacy_binary", "partial_credit"], default="legacy_binary")
     parser.add_argument("--judge-runs", type=int, default=5)
     parser.add_argument("--judge-retries", type=int, default=3)
     parser.add_argument("--judge-max-workers", type=int, default=1)
+    parser.add_argument(
+        "--enable-heuristic-bypass",
+        action="store_true",
+        help="Opt in to the old behavior where a heuristic answer can bypass the answer prompt.",
+    )
+    parser.add_argument(
+        "--disable-heuristic-bypass",
+        action="store_true",
+        help="Deprecated no-op compatibility flag. Heuristic bypass is disabled by default.",
+    )
     return parser.parse_args()
 
 
@@ -1284,10 +1342,18 @@ def main() -> None:
                 answer_view_text = ""
                 answer_messages: list[dict[str, str]] = []
                 answer_prompt_used = False
-                answer_prompt_mode = "heuristic" if heuristic_answer else "llm"
+                heuristic_bypass_triggered = bool(heuristic_answer)
+                heuristic_bypass_enabled = bool(args.enable_heuristic_bypass) and not bool(args.disable_heuristic_bypass)
+                heuristic_bypass_used = heuristic_bypass_triggered and heuristic_bypass_enabled
+                if heuristic_bypass_used:
+                    answer_prompt_mode = "heuristic"
+                elif heuristic_bypass_triggered:
+                    answer_prompt_mode = "llm_bypass_disabled"
+                else:
+                    answer_prompt_mode = "llm"
                 answer_prompt_input_tokens_est = 0
                 answer_max_tokens = 0
-                if heuristic_answer:
+                if heuristic_bypass_used:
                     predicted_answer = heuristic_answer
                     answer_input_tokens_est = 0
                 else:
@@ -1342,6 +1408,9 @@ def main() -> None:
                     "answer_prompt_input_tokens_est": answer_prompt_input_tokens_est,
                     "answer_prompt_used": answer_prompt_used,
                     "answer_prompt_mode": answer_prompt_mode,
+                    "heuristic_bypass_triggered": heuristic_bypass_triggered,
+                    "heuristic_bypass_enabled": heuristic_bypass_enabled,
+                    "heuristic_bypass_used": heuristic_bypass_used,
                     "answer_max_tokens": answer_max_tokens,
                     "heuristic_answer": heuristic_answer,
                     "raw_span_count": len(evidence.get("raw_spans") or []),
@@ -1393,6 +1462,7 @@ def main() -> None:
                         gold_answer=str(row["gold_answer"]),
                         predicted_answer=str(row["predicted_answer"]),
                         retries=args.judge_retries,
+                        judge_style=args.judge_style,
                     )
                     for _ in range(max(1, args.judge_runs))
                 ]
