@@ -8,7 +8,14 @@ from collections import Counter
 from functools import lru_cache
 
 from .normalize import EntityResolver, canonicalize_entity
-from .clients import ChatClient, OpenAICompatError, extract_json_object
+from .clients import (
+    ChatClient,
+    OpenAICompatError,
+    estimate_message_tokens,
+    extract_chat_text,
+    extract_json_object,
+    extract_prompt_tokens,
+)
 from .grounding import derive_temporal_grounding, span_surface_text
 from .schemas import GraphEdge, MemoryAtom, RawSpan
 
@@ -25,9 +32,19 @@ ENTITY_NOISE_WORDS = {
     "hey", "hi", "hello", "thanks", "thank", "wow", "cool", "great", "awesome", "okay",
     "ok", "yeah", "yep", "yup", "aww", "woah", "whoa",
 }
+ZH_ENTITY_NOISE_WORDS = {
+    "什么", "哪些", "哪个", "谁", "哪里", "哪天", "什么时候", "为何", "为什么", "如何",
+    "我们", "你们", "他们", "她们", "这个", "那个", "这些", "那些",
+    "事情", "经历", "话题", "问题", "方法", "建议", "技巧", "内容", "名字", "时间",
+    "一下", "一下子", "真的", "就是", "还是", "已经", "当时", "最近", "之前", "之后",
+    "感觉", "有点", "非常", "特别", "超级", "可以", "一下", "然后", "因为",
+}
+
+_LANGUAGE_MODE = "en"
 
 ENTITY_RESOLVER = EntityResolver()
-SEMANTIC_LEXICON = [
+SEMANTIC_LEXICON_BY_MODE = {
+    "en": [
     {
         "concept": "martial arts",
         "aliases": ["martial arts", "combat sport", "fighting style"],
@@ -66,14 +83,94 @@ SEMANTIC_LEXICON = [
             "counsellor": "counseling certification",
         },
     },
-]
+    ],
+    "zh": [
+        {
+            "concept": "减压放松",
+            "aliases": ["减压", "放松", "缓解压力", "舒缓压力", "放松心情", "释放压力", "舒压"],
+            "items": {
+                "冥想": "冥想",
+                "深呼吸": "深呼吸",
+                "瑜伽": "瑜伽",
+                "散步": "散步",
+                "听音乐": "听音乐",
+                "看电影": "看电影",
+                "读书": "读书",
+                "聊天": "聊天",
+            },
+        },
+        {
+            "concept": "艺术创作",
+            "aliases": ["画画", "绘画", "摄影", "拍照", "艺术", "展览", "博物馆", "展品"],
+            "items": {
+                "画画": "绘画",
+                "绘画": "绘画",
+                "摄影": "摄影",
+                "拍照": "摄影",
+                "博物馆": "博物馆",
+                "展览": "展览",
+                "展品": "展品",
+            },
+        },
+        {
+            "concept": "烹饪美食",
+            "aliases": ["做饭", "做菜", "菜谱", "做法", "食材", "调料", "烹饪", "美食"],
+            "items": {
+                "菜谱": "菜谱",
+                "做法": "做法",
+                "食材": "食材",
+                "调料": "调料",
+                "烹饪": "烹饪",
+                "做菜": "做菜",
+            },
+        },
+        {
+            "concept": "职业学习",
+            "aliases": ["工作", "职业", "事业", "学习", "课程", "训练", "英语", "编程"],
+            "items": {
+                "工作": "工作",
+                "职业": "职业",
+                "学习": "学习",
+                "课程": "课程",
+                "训练": "训练",
+                "英语": "英语",
+                "编程": "编程",
+            },
+        },
+        {
+            "concept": "音乐影视",
+            "aliases": ["音乐", "歌曲", "演唱会", "电影", "电视剧", "演员", "场景", "剧情"],
+            "items": {
+                "音乐": "音乐",
+                "歌曲": "歌曲",
+                "演唱会": "演唱会",
+                "电影": "电影",
+                "电视剧": "电视剧",
+                "剧情": "剧情",
+                "场景": "场景",
+            },
+        },
+    ],
+}
 SPACY_ENTITY_LABELS = {"PERSON", "ORG", "GPE", "LOC", "FAC", "EVENT", "WORK_OF_ART", "PRODUCT"}
-_SPACY_NLP = None
-_SPACY_INIT_ATTEMPTED = False
+_SPACY_NLP_BY_MODE: dict[str, Any] = {}
+_SPACY_INIT_ATTEMPTED: set[str] = set()
 _NLTK_READY = None
-_YAKE_KEYWORD_EXTRACTOR = None
-_YAKE_INIT_ATTEMPTED = False
+_YAKE_KEYWORD_EXTRACTOR_BY_MODE: dict[str, Any] = {}
+_YAKE_INIT_ATTEMPTED: set[str] = set()
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[\.\!\?。！？])\s+|\n+")
+
+
+def set_language_mode(mode: str) -> None:
+    global _LANGUAGE_MODE
+    normalized = str(mode or "en").strip().lower()
+    if normalized not in {"en", "zh"}:
+        raise ValueError(f"Unsupported language mode: {mode}")
+    _LANGUAGE_MODE = normalized
+
+
+def get_language_mode() -> str:
+    return _LANGUAGE_MODE
 
 
 def _env_enabled(*names: str) -> bool:
@@ -96,43 +193,44 @@ def stable_id(prefix: str, *parts: str) -> str:
     return f"{prefix}_{digest}"
 
 
-def _get_spacy_nlp():
-    global _SPACY_NLP, _SPACY_INIT_ATTEMPTED
-    if _SPACY_INIT_ATTEMPTED:
-        return _SPACY_NLP
-    _SPACY_INIT_ATTEMPTED = True
+def _get_spacy_nlp(mode: str | None = None):
+    language_mode = str(mode or get_language_mode() or "en").strip().lower()
+    if language_mode in _SPACY_INIT_ATTEMPTED:
+        return _SPACY_NLP_BY_MODE.get(language_mode)
+    _SPACY_INIT_ATTEMPTED.add(language_mode)
     if _env_enabled("LEAF_DISABLE_SPACY"):
         return None
     try:
         import spacy
     except ImportError:
         return None
-    model_names = [
-        _env_first("LEAF_SPACY_MODEL"),
-        "en_core_web_sm",
-    ]
+    model_names = (
+        [_env_first("LEAF_SPACY_MODEL_ZH"), _env_first("LEAF_SPACY_MODEL"), "zh_core_web_sm"]
+        if language_mode == "zh"
+        else [_env_first("LEAF_SPACY_MODEL_EN"), _env_first("LEAF_SPACY_MODEL"), "en_core_web_sm"]
+    )
     for model_name in model_names:
         if not model_name:
             continue
         try:
-            _SPACY_NLP = spacy.load(model_name, disable=["lemmatizer"])
-            return _SPACY_NLP
+            _SPACY_NLP_BY_MODE[language_mode] = spacy.load(model_name, disable=["lemmatizer"])
+            return _SPACY_NLP_BY_MODE[language_mode]
         except OSError:
             try:
                 model_module = importlib.import_module(model_name)
                 if hasattr(model_module, "load"):
-                    _SPACY_NLP = model_module.load(disable=["lemmatizer"])
-                    return _SPACY_NLP
+                    _SPACY_NLP_BY_MODE[language_mode] = model_module.load(disable=["lemmatizer"])
+                    return _SPACY_NLP_BY_MODE[language_mode]
             except Exception:
                 continue
     return None
 
 
-def _get_yake_extractor():
-    global _YAKE_KEYWORD_EXTRACTOR, _YAKE_INIT_ATTEMPTED
-    if _YAKE_INIT_ATTEMPTED:
-        return _YAKE_KEYWORD_EXTRACTOR
-    _YAKE_INIT_ATTEMPTED = True
+def _get_yake_extractor(mode: str | None = None):
+    language_mode = str(mode or get_language_mode() or "en").strip().lower()
+    if language_mode in _YAKE_INIT_ATTEMPTED:
+        return _YAKE_KEYWORD_EXTRACTOR_BY_MODE.get(language_mode)
+    _YAKE_INIT_ATTEMPTED.add(language_mode)
     if _env_enabled("LEAF_DISABLE_YAKE"):
         return None
     try:
@@ -140,8 +238,8 @@ def _get_yake_extractor():
     except ImportError:
         return None
     try:
-        _YAKE_KEYWORD_EXTRACTOR = yake.KeywordExtractor(
-            lan="en",
+        _YAKE_KEYWORD_EXTRACTOR_BY_MODE[language_mode] = yake.KeywordExtractor(
+            lan="zh" if language_mode == "zh" else "en",
             n=2,
             dedupLim=0.85,
             dedupFunc="seqm",
@@ -149,12 +247,12 @@ def _get_yake_extractor():
             top=12,
         )
     except Exception:
-        _YAKE_KEYWORD_EXTRACTOR = None
-    return _YAKE_KEYWORD_EXTRACTOR
+        _YAKE_KEYWORD_EXTRACTOR_BY_MODE[language_mode] = None
+    return _YAKE_KEYWORD_EXTRACTOR_BY_MODE[language_mode]
 
 
-def _spacy_entity_candidates(text: str) -> list[str]:
-    nlp = _get_spacy_nlp()
+def _spacy_entity_candidates(text: str, mode: str | None = None) -> list[str]:
+    nlp = _get_spacy_nlp(mode)
     if nlp is None:
         return []
     try:
@@ -197,7 +295,10 @@ def _ensure_nltk_ready() -> bool:
     return _NLTK_READY
 
 
-def _nltk_entity_candidates(text: str) -> list[str]:
+def _nltk_entity_candidates(text: str, mode: str | None = None) -> list[str]:
+    language_mode = str(mode or get_language_mode() or "en").strip().lower()
+    if language_mode != "en":
+        return []
     if _env_enabled("LEAF_DISABLE_NLTK"):
         return []
     if not _ensure_nltk_ready():
@@ -233,40 +334,89 @@ def _nltk_entity_candidates(text: str) -> list[str]:
     return candidates
 
 
-def extract_entities(text: str) -> list[str]:
-    entities: list[str] = []
-    entities.extend(_spacy_entity_candidates(text))
-    entities.extend(_nltk_entity_candidates(text))
-    quoted = re.findall(r'"([^"]{2,80})"', text)
-    entities.extend(value.strip() for value in quoted)
-    capitalized_phrases = re.findall(r"\b(?:[A-Z][a-zA-Z0-9_-]{1,}(?:\s+[A-Z][a-zA-Z0-9_-]{1,}){1,3})\b", text)
-    entities.extend(capitalized_phrases)
-    phrase_parts: set[str] = set()
-    for phrase in capitalized_phrases:
-        canonical_phrase = canonicalize_entities([phrase], limit=1)
-        if canonical_phrase:
-            phrase_parts.update(canonical_phrase[0].split())
-    capitalized = re.findall(r"\b[A-Z][a-zA-Z0-9_-]{2,}\b", text)
-    for token in capitalized:
-        canonical_token = ENTITY_RESOLVER.resolve(token.strip()).canonical
-        if canonical_token and canonical_token in phrase_parts:
+def _zh_phrase_candidates(text: str) -> list[str]:
+    candidates: list[str] = []
+    candidates.extend(value.strip() for value in re.findall(r"《([^》]{1,80})》", text))
+    candidates.extend(value.strip() for value in re.findall(r"[“\"]([^”\"]{2,80})[”\"]", text))
+    candidates.extend(value.strip() for value in re.findall(r"[「『]([^」』]{2,80})[」』]", text))
+    candidates.extend(value.strip() for value in re.findall(r"\b[A-Za-z][A-Za-z0-9._+-]{1,}\b", text))
+    candidates.extend(value.strip() for value in re.findall(r"\b[A-Z][a-zA-Z0-9_-]{1,}(?:\s+[A-Z][a-zA-Z0-9_-]{1,}){0,3}\b", text))
+    for match in re.finditer(r"([\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,8})的演唱会", text):
+        candidates.append(match.group(1))
+    for match in re.finditer(
+        r"([\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,12}(?:博物馆|展览|演唱会|电影|电视剧|歌曲|画展|摄影展|公园|餐厅|课程|比赛))",
+        text,
+    ):
+        candidates.append(match.group(1))
+    for match in re.finditer(
+        r"(?:去了|参观了|看了|喜欢|最喜欢|学习|学了)([\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,10})",
+        text,
+    ):
+        phrase = match.group(1)
+        if any(marker in phrase for marker in ("什么", "哪些", "哪个", "为什么", "怎么", "如何")):
             continue
-        entities.append(token)
-    keywords = re.findall(r"\b[a-zA-Z][a-zA-Z0-9_-]{3,}\b", text.lower())
-    counts = Counter(token for token in keywords if token not in STOPWORDS)
-    entities.extend(token for token, count in counts.items() if count >= 2)
+        candidates.append(phrase)
+    return candidates
+
+
+def _clean_zh_candidate(text: str) -> str:
+    cleaned = str(text or "").strip()
+    cleaned = re.sub(r"^(我最近|最近|另外我在|我在|我曾经|你最近|你曾经)", "", cleaned)
+    cleaned = re.sub(r"^(去看了|看了|去了|参观了|学了|学习了|最喜欢|喜欢)", "", cleaned)
+    cleaned = re.sub(r"^\d{1,2}月\d{1,2}[日号]?", "", cleaned)
+    cleaned = re.sub(r"^(号|日)", "", cleaned)
+    cleaned = re.sub(r"^(去看了|看了|去了|参观了|学了|学习了|最喜欢|喜欢)", "", cleaned)
+    return cleaned.strip()
+
+
+def extract_entities(text: str, mode: str | None = None) -> list[str]:
+    language_mode = str(mode or get_language_mode() or "en").strip().lower()
+    entities: list[str] = []
+    entities.extend(_spacy_entity_candidates(text, mode=language_mode))
+    entities.extend(_nltk_entity_candidates(text, mode=language_mode))
+    if language_mode == "zh":
+        entities.extend(_zh_phrase_candidates(text))
+    else:
+        quoted = re.findall(r'"([^"]{2,80})"', text)
+        entities.extend(value.strip() for value in quoted)
+        capitalized_phrases = re.findall(r"\b(?:[A-Z][a-zA-Z0-9_-]{1,}(?:\s+[A-Z][a-zA-Z0-9_-]{1,}){1,3})\b", text)
+        entities.extend(capitalized_phrases)
+        phrase_parts: set[str] = set()
+        for phrase in capitalized_phrases:
+            canonical_phrase = canonicalize_entities([phrase], limit=1)
+            if canonical_phrase:
+                phrase_parts.update(canonical_phrase[0].split())
+        capitalized = re.findall(r"\b[A-Z][a-zA-Z0-9_-]{2,}\b", text)
+        for token in capitalized:
+            canonical_token = ENTITY_RESOLVER.resolve(token.strip()).canonical
+            if canonical_token and canonical_token in phrase_parts:
+                continue
+            entities.append(token)
+        keywords = re.findall(r"\b[a-zA-Z][a-zA-Z0-9_-]{3,}\b", text.lower())
+        counts = Counter(token for token in keywords if token not in STOPWORDS)
+        entities.extend(token for token, count in counts.items() if count >= 2)
     deduped: list[str] = []
     seen: set[str] = set()
     for entity in entities:
-        resolved = ENTITY_RESOLVER.resolve(entity.strip())
+        candidate = _clean_zh_candidate(entity) if language_mode == "zh" else entity
+        if not candidate:
+            continue
+        resolved = ENTITY_RESOLVER.resolve(candidate.strip())
         key = resolved.canonical
         if not key:
             continue
-        key_tokens = [token for token in re.split(r"[^a-z0-9]+", key) if token]
-        if not key_tokens:
-            continue
-        if all(token in ENTITY_NOISE_WORDS or token in STOPWORDS for token in key_tokens):
-            continue
+        if language_mode == "zh":
+            key_tokens = [token for token in re.split(r"[^a-z0-9\u3400-\u9fff]+", key) if token]
+            if not key_tokens:
+                continue
+            if all(token in ZH_ENTITY_NOISE_WORDS or token in ENTITY_NOISE_WORDS or token in STOPWORDS for token in key_tokens):
+                continue
+        else:
+            key_tokens = [token for token in re.split(r"[^a-z0-9]+", key) if token]
+            if not key_tokens:
+                continue
+            if all(token in ENTITY_NOISE_WORDS or token in STOPWORDS for token in key_tokens):
+                continue
         if not key or key in seen:
             continue
         seen.add(key)
@@ -274,15 +424,22 @@ def extract_entities(text: str) -> list[str]:
     return deduped[:8]
 
 
-def extract_semantic_references(text: str) -> list[str]:
+def extract_semantic_references(text: str, mode: str | None = None) -> list[str]:
+    language_mode = str(mode or get_language_mode() or "en").strip().lower()
     lowered = f" {str(text or '').lower()} "
     refs: list[str] = []
     seen: set[str] = set()
-    for spec in SEMANTIC_LEXICON:
+    for spec in SEMANTIC_LEXICON_BY_MODE.get(language_mode, SEMANTIC_LEXICON_BY_MODE["en"]):
         concept = str(spec["concept"])
-        concept_hit = any(f" {alias} " in lowered for alias in spec["aliases"])
+        concept_hit = any(
+            alias in str(text or "")
+            if language_mode == "zh"
+            else f" {alias} " in lowered
+            for alias in spec["aliases"]
+        )
         for alias, canonical in spec["items"].items():
-            if f" {alias} " in lowered and canonical not in seen:
+            alias_hit = alias in str(text or "") if language_mode == "zh" else f" {alias} " in lowered
+            if alias_hit and canonical not in seen:
                 refs.append(canonical)
                 seen.add(canonical)
                 concept_hit = True
@@ -377,6 +534,10 @@ def _normalize_tag(text: str) -> str:
     lowered = re.sub(r"^[^a-z0-9\u3400-\u9fff]+|[^a-z0-9\u3400-\u9fff]+$", "", lowered)
     if not lowered:
         return ""
+    if any(marker in lowered for marker in ("。", "，", ",", "?", "？", "!", "！", ":", "：", ";", "；", "\n")):
+        return ""
+    if len(lowered) > 20:
+        return ""
     tokens = [token for token in re.split(r"[^a-z0-9\u3400-\u9fff]+", lowered) if token]
     if not tokens:
         return ""
@@ -396,7 +557,7 @@ def build_text_tags(texts: list[str], max_tags: int = 5) -> list[str]:
     if not merged:
         return []
     candidates: list[str] = []
-    extractor = _get_yake_extractor()
+    extractor = _get_yake_extractor(get_language_mode())
     if extractor is not None:
         try:
             for keyword, _score in extractor.extract_keywords(merged):
@@ -487,6 +648,19 @@ def make_evidence_preview(texts: list[str], limit: int = 3, max_chars: int = 180
 class AtomExtractor:
     def __init__(self, llm: ChatClient | None = None):
         self.llm = llm
+        self._runtime_metrics: dict[str, int] | None = None
+
+    def reset_runtime_metrics(self) -> None:
+        self._runtime_metrics = {
+            "atom_prompt_tokens_total": 0,
+            "atom_prompt_tokens_provider_usage_calls": 0,
+            "atom_prompt_tokens_estimated_calls": 0,
+        }
+
+    def consume_runtime_metrics(self) -> dict[str, int]:
+        metrics = dict(self._runtime_metrics or {})
+        self._runtime_metrics = None
+        return metrics
 
     def extract_atoms(self, span: RawSpan) -> list[MemoryAtom]:
         atoms = self._heuristic_atoms(span)
@@ -573,11 +747,19 @@ class AtomExtractor:
                 "content": f"speaker={span.speaker}\ntext={span.text}",
             },
         ]
+        prompt_tokens = estimate_message_tokens(messages)
         try:
-            response = self.llm.text(messages, max_tokens=400, temperature=0.0)
-            payload = extract_json_object(response)
+            response = self.llm.chat(messages, max_tokens=400, temperature=0.0)
+            provider_prompt_tokens = extract_prompt_tokens(response)
+            if provider_prompt_tokens is not None:
+                prompt_tokens = provider_prompt_tokens
+            payload = extract_json_object(extract_chat_text(response))
         except (OpenAICompatError, ValueError):
             return []
+        self._record_prompt_tokens(
+            prompt_tokens=prompt_tokens,
+            from_provider_usage=provider_prompt_tokens is not None,
+        )
         atoms: list[MemoryAtom] = []
         for item in payload.get("atoms") or []:
             atom_type = str(item.get("type") or "").strip().lower()
@@ -616,6 +798,21 @@ class AtomExtractor:
             confidence=confidence,
             metadata=metadata,
         )
+
+    def _record_prompt_tokens(self, *, prompt_tokens: int, from_provider_usage: bool) -> None:
+        if not isinstance(self._runtime_metrics, dict):
+            return
+        self._runtime_metrics["atom_prompt_tokens_total"] = int(
+            self._runtime_metrics.get("atom_prompt_tokens_total", 0)
+        ) + int(prompt_tokens)
+        if from_provider_usage:
+            self._runtime_metrics["atom_prompt_tokens_provider_usage_calls"] = int(
+                self._runtime_metrics.get("atom_prompt_tokens_provider_usage_calls", 0)
+            ) + 1
+        else:
+            self._runtime_metrics["atom_prompt_tokens_estimated_calls"] = int(
+                self._runtime_metrics.get("atom_prompt_tokens_estimated_calls", 0)
+            ) + 1
 
 
 def build_graph_edges(span: RawSpan, atoms: list[MemoryAtom]) -> list[GraphEdge]:

@@ -8,8 +8,9 @@ from functools import lru_cache
 from typing import Any
 
 from .clients import EmbeddingClient, cosine_similarity
-from .extract import extract_entities, extract_semantic_references
+from .extract import extract_entities, extract_semantic_references, get_language_mode as get_extract_language_mode
 from .grounding import (
+    get_language_mode as get_grounding_language_mode,
     is_inference_query,
     is_temporal_query,
     parse_anchor_datetime,
@@ -104,7 +105,7 @@ QUERY_ALIASES = {
     },
 }
 
-SEMANTIC_HINTS = {
+SEMANTIC_EXPANSIONS = {
     "destress": ["stress relief", "relax", "unwind", "escape"],
     "de stress": ["stress relief", "relax", "unwind", "escape"],
     "de-stress": ["stress relief", "relax", "unwind", "escape"],
@@ -159,6 +160,22 @@ LIST_QUERY_PATTERNS = (
     "what are some",
     "what were they",
 )
+LIST_QUERY_PATTERNS_ZH = (
+    "哪些",
+    "哪几",
+    "什么书",
+    "什么建议",
+    "什么技巧",
+    "什么方法",
+    "什么地方",
+    "什么话题",
+    "哪些话题",
+    "哪些电影",
+    "哪些音乐",
+    "哪些画家",
+    "哪些菜",
+    "哪些方式",
+)
 
 SINGLE_FACT_PATTERNS = (
     "what was its name",
@@ -178,6 +195,17 @@ SINGLE_FACT_PATTERNS = (
     "what's my favorite",
 )
 
+SEMANTIC_EXPANSIONS_ZH = {
+    "减压": ["放松", "缓解压力", "舒缓", "冥想", "深呼吸", "瑜伽"],
+    "放松": ["减压", "舒缓", "冥想", "深呼吸", "瑜伽"],
+    "绘画": ["画画", "艺术", "画家", "展览"],
+    "摄影": ["拍照", "光线", "角度", "构图"],
+    "演唱会": ["歌曲", "音乐", "歌手"],
+    "电影": ["剧情", "场景", "演员"],
+    "做法": ["菜谱", "食材", "调料", "烹饪"],
+    "英语": ["口语", "听力", "英文电影", "英语歌"],
+}
+
 YES_NO_PREFIXES = (
     "do ",
     "does ",
@@ -195,30 +223,30 @@ YES_NO_PREFIXES = (
     "had ",
 )
 
-OPEN_DOMAIN_SUPPORT_HINTS = [
+OPEN_DOMAIN_SUPPORT_PATTERNS = [
     {
         "patterns": [" likely ", " likely to ", " would ", " be considered ", " considered "],
-        "hints": ["values", "beliefs", "preferences", "goals", "supportive", "interested in"],
+        "support_terms": ["values", "beliefs", "preferences", "goals", "supportive", "interested in"],
     },
     {
         "patterns": [" personality ", " traits ", " attributes ", " describe "],
-        "hints": ["described as", "personality", "supportive", "thoughtful", "driven", "authentic"],
+        "support_terms": ["described as", "personality", "supportive", "thoughtful", "driven", "authentic"],
     },
     {
         "patterns": [" future job ", " pursue in the future ", " career ", " field ", " education "],
-        "hints": ["career", "job", "study", "training", "wants to", "goal", "interested in"],
+        "support_terms": ["career", "job", "study", "training", "wants to", "goal", "interested in"],
     },
     {
         "patterns": [" political leaning ", " religious ", " ally ", " patriotic "],
-        "hints": ["beliefs", "values", "support", "community", "identity"],
+        "support_terms": ["beliefs", "values", "support", "community", "identity"],
     },
     {
         "patterns": [" move to ", " move back ", " another country ", " home country "],
-        "hints": ["plans", "goals", "family", "adoption", "future", "wants to stay"],
+        "support_terms": ["plans", "goals", "family", "adoption", "future", "wants to stay"],
     },
 ]
 
-USE_QUERY_HINTS_FOR_LEXICAL = True
+USE_QUERY_EXPANSIONS_FOR_LEXICAL = True
 USE_BROAD_BLOCK_EXPANSION = True
 USE_LIGHT_NEIGHBOR_EXPANSION = False
 USE_LEXICAL_EDGE_EXPANSION = False
@@ -303,26 +331,28 @@ def _token_variants(token: str) -> set[str]:
 
 
 @lru_cache(maxsize=50000)
-def _cached_query_tokens_tuple(text: str) -> tuple[str, ...]:
+def _cached_query_tokens_tuple(mode: str, text: str) -> tuple[str, ...]:
     return tuple(str(item).strip() for item in make_query_tokens(str(text or "")) if str(item).strip())
 
 
 @lru_cache(maxsize=20000)
-def _cached_extract_entities_tuple(text: str) -> tuple[str, ...]:
-    return tuple(str(item).strip() for item in extract_entities(str(text or "")) if str(item).strip())
+def _cached_extract_entities_tuple(mode: str, text: str) -> tuple[str, ...]:
+    return tuple(str(item).strip() for item in extract_entities(str(text or ""), mode=mode) if str(item).strip())
 
 
 @lru_cache(maxsize=20000)
-def _cached_extract_semantic_refs_tuple(text: str) -> tuple[str, ...]:
-    return tuple(str(item).strip() for item in extract_semantic_references(str(text or "")) if str(item).strip())
+def _cached_extract_semantic_refs_tuple(mode: str, text: str) -> tuple[str, ...]:
+    return tuple(
+        str(item).strip() for item in extract_semantic_references(str(text or ""), mode=mode) if str(item).strip()
+    )
 
 
 @lru_cache(maxsize=50000)
-def _cached_query_terms_frozen(text: str) -> frozenset[str]:
+def _cached_query_terms_frozen(mode: str, text: str) -> frozenset[str]:
     key = str(text or "")
-    refs = list(_cached_extract_entities_tuple(key))
-    refs.extend(_cached_extract_semantic_refs_tuple(key))
-    refs.extend(_cached_query_tokens_tuple(key))
+    refs = list(_cached_extract_entities_tuple(mode, key))
+    refs.extend(_cached_extract_semantic_refs_tuple(mode, key))
+    refs.extend(_cached_query_tokens_tuple(mode, key))
     normalized: set[str] = set()
     for item in refs:
         normalized_item = str(item).strip().lower()
@@ -346,28 +376,31 @@ def _cached_query_terms_frozen(text: str) -> frozenset[str]:
 
 
 @lru_cache(maxsize=100000)
-def _cached_document_terms_frozen(text: str) -> frozenset[str]:
+def _cached_document_terms_frozen(mode: str, text: str) -> frozenset[str]:
     key = str(text or "")
     normalized: set[str] = set()
-    for token in ALNUM_PATTERN.findall(key.lower()):
-        if not token or token in QUERY_STOPWORDS:
-            continue
-        normalized.add(token)
-        if token.endswith("ies") and len(token) > 4:
-            normalized.add(token[:-3] + "y")
-        elif token.endswith("es") and len(token) > 4:
-            normalized.add(token[:-2])
-        elif token.endswith("s") and len(token) > 4 and not token.endswith("ss"):
-            normalized.add(token[:-1])
-        if token.endswith("ing") and len(token) > 5:
-            normalized.add(_trim_repeated_suffix_letter(token[:-3]))
-        elif token.endswith("ed") and len(token) > 4:
-            stem = _trim_repeated_suffix_letter(token[:-2])
-            normalized.add(stem)
-            if stem.endswith("i") and len(stem) > 3:
-                normalized.add(stem[:-1] + "y")
-        for alias in QUERY_ALIASES.get(token, set()):
-            normalized.add(alias)
+    if mode == "zh":
+        normalized.update(_cached_query_tokens_tuple(mode, key))
+    else:
+        for token in ALNUM_PATTERN.findall(key.lower()):
+            if not token or token in QUERY_STOPWORDS:
+                continue
+            normalized.add(token)
+            if token.endswith("ies") and len(token) > 4:
+                normalized.add(token[:-3] + "y")
+            elif token.endswith("es") and len(token) > 4:
+                normalized.add(token[:-2])
+            elif token.endswith("s") and len(token) > 4 and not token.endswith("ss"):
+                normalized.add(token[:-1])
+            if token.endswith("ing") and len(token) > 5:
+                normalized.add(_trim_repeated_suffix_letter(token[:-3]))
+            elif token.endswith("ed") and len(token) > 4:
+                stem = _trim_repeated_suffix_letter(token[:-2])
+                normalized.add(stem)
+                if stem.endswith("i") and len(stem) > 3:
+                    normalized.add(stem[:-1] + "y")
+            for alias in QUERY_ALIASES.get(token, set()):
+                normalized.add(alias)
     return frozenset(normalized)
 
 
@@ -409,7 +442,7 @@ def _route_query_intents(query: str) -> list[str]:
         intents.append("preference")
     if is_inference_query(query):
         intents.append("persona_inference")
-    if any(pattern in padded for spec in OPEN_DOMAIN_SUPPORT_HINTS for pattern in spec["patterns"]):
+    if any(pattern in padded for spec in OPEN_DOMAIN_SUPPORT_PATTERNS for pattern in spec["patterns"]):
         intents.append("open_domain_inference")
     if any(token in lowered for token in ["who", "what", "which", "when"]):
         intents.append("factual_recall")
@@ -418,26 +451,29 @@ def _route_query_intents(query: str) -> list[str]:
     return intents
 
 
-def _support_pattern_hints(query: str, intents: list[str]) -> list[str]:
+def _support_pattern_terms(query: str, intents: list[str]) -> list[str]:
     padded = f" {str(query or '').strip().lower()} "
-    hints: list[str] = []
+    support_terms: list[str] = []
     if "open_domain_inference" not in intents and "persona_inference" not in intents:
-        return hints
-    for spec in OPEN_DOMAIN_SUPPORT_HINTS:
+        return support_terms
+    for spec in OPEN_DOMAIN_SUPPORT_PATTERNS:
         if any(pattern in padded for pattern in spec["patterns"]):
-            hints.extend(spec["hints"])
+            support_terms.extend(spec["support_terms"])
     if "persona_inference" in intents:
-        hints.extend(["values", "goals", "beliefs", "personality", "supportive"])
-    return _ordered_unique_strings(hints)[:10]
+        support_terms.extend(["values", "goals", "beliefs", "personality", "supportive"])
+    return _ordered_unique_strings(support_terms)[:10]
 
 
-def _semantic_query_hints(query: str) -> list[str]:
+def _semantic_query_expansions(query: str) -> list[str]:
     lowered = str(query or "").lower()
-    hints: list[str] = []
-    for phrase, expansions in SEMANTIC_HINTS.items():
-        if phrase in lowered:
-            hints.extend(expansions)
-    return _ordered_unique_strings(hints)[:8]
+    expansions: list[str] = []
+    language_mode = get_extract_language_mode()
+    semantic_expansions = SEMANTIC_EXPANSIONS_ZH if language_mode == "zh" else SEMANTIC_EXPANSIONS
+    query_text = str(query or "")
+    for phrase, related_terms in semantic_expansions.items():
+        if (phrase in query_text) if language_mode == "zh" else (phrase in lowered):
+            expansions.extend(related_terms)
+    return _ordered_unique_strings(expansions)[:8]
 
 
 def _requires_entity_coverage(query: str, query_entities: list[str]) -> bool:
@@ -456,19 +492,20 @@ def _query_recall_terms(
     *,
     question: str,
     query_entities: list[str],
-    semantic_hints: list[str],
-    support_hints: list[str],
+    semantic_expansions: list[str],
+    support_terms: list[str],
 ) -> list[str]:
+    language_mode = get_grounding_language_mode()
     recall_terms: list[str] = []
-    recall_terms.extend(str(item).strip().lower() for item in _cached_query_tokens_tuple(str(question or "")))
+    recall_terms.extend(str(item).strip().lower() for item in _cached_query_tokens_tuple(language_mode, str(question or "")))
     for entity in query_entities:
         normalized_entity = str(entity or "").strip().lower()
         if not normalized_entity:
             continue
         recall_terms.append(normalized_entity.replace(" ", ""))
         recall_terms.extend(ALNUM_PATTERN.findall(normalized_entity))
-    hint_text = " ".join([str(item or "") for item in semantic_hints + support_hints])
-    recall_terms.extend(ALNUM_PATTERN.findall(hint_text.lower()))
+    expanded_text = " ".join([str(item or "") for item in semantic_expansions + support_terms])
+    recall_terms.extend(ALNUM_PATTERN.findall(expanded_text.lower()))
     ordered = _ordered_unique_strings(recall_terms)
     return [
         term
@@ -606,26 +643,37 @@ def query_terms(question: str) -> set[str]:
     return normalized
 
 
-def query_temporal_hints(question: str) -> dict[str, int]:
+def query_temporal_filters(question: str) -> dict[str, int]:
     lowered = str(question or "").lower()
-    hints: dict[str, int] = {}
+    filters: dict[str, int] = {}
     year_match = re.search(r"\b(19|20)\d{2}\b", lowered)
     if year_match:
-        hints["year"] = int(year_match.group(0))
+        filters["year"] = int(year_match.group(0))
+    zh_year_match = re.search(r"(19|20)\d{2}年", str(question or ""))
+    if zh_year_match:
+        filters["year"] = int(zh_year_match.group(0)[:-1])
     for month_name, month_number in MONTH_NUMBERS.items():
         if re.search(rf"\b{month_name}\b", lowered):
-            hints["month"] = month_number
+            filters["month"] = month_number
             day_match = re.search(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+{month_name}\b", lowered)
             if not day_match:
                 day_match = re.search(rf"\b{month_name}\s+(\d{{1,2}})(?:st|nd|rd|th)?\b", lowered)
             if day_match:
-                hints["day"] = int(day_match.group(1))
+                filters["day"] = int(day_match.group(1))
             break
-    return hints
+    zh_date_match = re.search(r"(?:(19|20)\d{2}年)?\s*(?P<month>\d{1,2})月(?P<day>\d{1,2})[日号]?", str(question or ""))
+    if zh_date_match:
+        filters["month"] = int(zh_date_match.group("month"))
+        filters["day"] = int(zh_date_match.group("day"))
+    return filters
 
 
 def is_list_query(question: str) -> bool:
+    language_mode = get_grounding_language_mode()
     lowered = str(question or "").strip().lower()
+    if language_mode == "zh":
+        text = str(question or "").strip()
+        return any(pattern in text for pattern in LIST_QUERY_PATTERNS_ZH)
     return any(pattern in lowered for pattern in LIST_QUERY_PATTERNS)
 
 
@@ -642,9 +690,9 @@ def is_single_fact_query(question: str) -> bool:
     return bool(re.search(r"\b(what\s+(is|was)|where|which|who|when)\b", lowered))
 
 
-def target_date_key(temporal_hints: dict[str, int]) -> str | None:
-    month = temporal_hints.get("month")
-    day = temporal_hints.get("day")
+def target_date_key(temporal_filters: dict[str, int]) -> str | None:
+    month = temporal_filters.get("month")
+    day = temporal_filters.get("day")
     if month is None or day is None:
         return None
     return f"{int(month):02d}-{int(day):02d}"
@@ -764,9 +812,9 @@ def retrieve_leaf_memory(
 
     query_intent_started_at = time.perf_counter()
     intents = _route_query_intents(question)
-    support_hints = _support_pattern_hints(question, intents)
-    semantic_hints = _semantic_query_hints(question)
-    stage_timings_ms["query_intent_hints"] = round((time.perf_counter() - query_intent_started_at) * 1000.0, 2)
+    support_terms = _support_pattern_terms(question, intents)
+    semantic_expansions = _semantic_query_expansions(question)
+    stage_timings_ms["query_intent_expansion"] = round((time.perf_counter() - query_intent_started_at) * 1000.0, 2)
 
     query_embedding_started_at = time.perf_counter()
     query_embedding = embedding.embed(question)
@@ -778,12 +826,13 @@ def retrieve_leaf_memory(
     query_token_cache: dict[str, list[str]] = {}
     query_term_cache: dict[str, set[str]] = {}
     document_term_cache: dict[str, set[str]] = {}
+    language_mode = get_grounding_language_mode()
 
     def cached_extract_entities(text: str) -> list[str]:
         key = str(text or "")
         cached = entity_text_cache.get(key)
         if cached is None:
-            cached = list(_cached_extract_entities_tuple(key))
+            cached = list(_cached_extract_entities_tuple(language_mode, key))
             entity_text_cache[key] = cached
         return cached
 
@@ -791,7 +840,7 @@ def retrieve_leaf_memory(
         key = str(text or "")
         cached = semantic_ref_cache.get(key)
         if cached is None:
-            cached = list(_cached_extract_semantic_refs_tuple(key))
+            cached = list(_cached_extract_semantic_refs_tuple(language_mode, key))
             semantic_ref_cache[key] = cached
         return cached
 
@@ -799,7 +848,7 @@ def retrieve_leaf_memory(
         key = str(text or "")
         cached = query_token_cache.get(key)
         if cached is None:
-            cached = list(_cached_query_tokens_tuple(key))
+            cached = list(_cached_query_tokens_tuple(language_mode, key))
             query_token_cache[key] = cached
         return cached
 
@@ -808,7 +857,7 @@ def retrieve_leaf_memory(
         cached = query_term_cache.get(key)
         if cached is not None:
             return cached
-        cached = set(_cached_query_terms_frozen(key))
+        cached = set(_cached_query_terms_frozen(language_mode, key))
         query_term_cache[key] = cached
         return cached
 
@@ -817,13 +866,13 @@ def retrieve_leaf_memory(
         cached = document_term_cache.get(key)
         if cached is not None:
             return cached
-        cached = set(_cached_document_terms_frozen(key))
+        cached = set(_cached_document_terms_frozen(language_mode, key))
         document_term_cache[key] = cached
         return cached
 
     lexical_query_text = question
-    if USE_QUERY_HINTS_FOR_LEXICAL:
-        lexical_query_text = "\n".join(_ordered_unique_strings([question] + semantic_hints + support_hints))
+    if USE_QUERY_EXPANSIONS_FOR_LEXICAL:
+        lexical_query_text = "\n".join(_ordered_unique_strings([question] + semantic_expansions + support_terms))
     normalized_query_terms = cached_query_terms(lexical_query_text)
     lowered_question = str(question or "").strip().lower()
     list_query = is_list_query(question)
@@ -834,16 +883,16 @@ def retrieve_leaf_memory(
     recall_terms = _query_recall_terms(
         question=lexical_query_text,
         query_entities=query_entities,
-        semantic_hints=semantic_hints,
-        support_hints=support_hints,
+        semantic_expansions=semantic_expansions,
+        support_terms=support_terms,
     )
-    temporal_hints = query_temporal_hints(question)
-    explicit_target_date = target_date_key(temporal_hints)
+    temporal_filters = query_temporal_filters(question)
+    explicit_target_date = target_date_key(temporal_filters)
     single_fact_query = is_single_fact_query(question)
     prefer_temporal_focus = explicit_target_date is not None
     prefer_temporal_diversity = (
         not prefer_temporal_focus
-        and (bool(temporal_hints) or lowered_question.startswith("how many "))
+        and (bool(temporal_filters) or lowered_question.startswith("how many "))
     )
     focus_first_conversation = "first conversation" in lowered_question
     focus_last_conversation = any(token in lowered_question for token in ["last conversation", "most recent conversation", "latest conversation"])
@@ -903,17 +952,17 @@ def retrieve_leaf_memory(
         return len(normalized_query_terms.intersection(merged_terms)) / max(1, len(normalized_query_terms))
 
     def score_temporal(timestamp: str | None) -> float:
-        if not temporal_hints or not timestamp:
+        if not temporal_filters or not timestamp:
             return 0.0
         anchor = parse_anchor_datetime(timestamp)
         if anchor is None:
             return 0.0
         score = 0.0
-        if temporal_hints.get("year") == anchor.year:
+        if temporal_filters.get("year") == anchor.year:
             score += 0.18
-        if temporal_hints.get("month") == anchor.month:
+        if temporal_filters.get("month") == anchor.month:
             score += 0.28
-        if temporal_hints.get("day") == anchor.day:
+        if temporal_filters.get("day") == anchor.day:
             score += 0.36
         if explicit_target_date is not None:
             if anchor.strftime("%m-%d") == explicit_target_date:
@@ -1635,7 +1684,7 @@ def retrieve_leaf_memory(
                 atom_score += 0.06
             if prefer_inference_support and atom.memory_kind in {"state", "preference", "plan", "relation"}:
                 atom_score += 0.1
-            if temporal_hints and atom.time_range:
+            if temporal_filters and atom.time_range:
                 atom_score += 0.08
             atom_score_by_event[atom.event_id] = max(atom_score_by_event.get(atom.event_id, 0.0), atom_score)
             atom_score_rows.append((atom_score, atom))
@@ -1838,7 +1887,7 @@ def retrieve_leaf_memory(
             "search_total_ms": total_elapsed_ms,
             "breakdown_ms": stage_timings_ms,
             "flags": {
-                "use_query_hints_for_lexical": USE_QUERY_HINTS_FOR_LEXICAL,
+                "use_query_expansions_for_lexical": USE_QUERY_EXPANSIONS_FOR_LEXICAL,
                 "use_broad_block_expansion": USE_BROAD_BLOCK_EXPANSION,
                 "use_light_neighbor_expansion": USE_LIGHT_NEIGHBOR_EXPANSION,
                 "use_lexical_edge_expansion": USE_LEXICAL_EDGE_EXPANSION,

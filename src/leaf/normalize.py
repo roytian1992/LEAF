@@ -1,23 +1,135 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from functools import lru_cache
+
+try:
+    import regex as unicode_re
+except ImportError:  # pragma: no cover - optional dependency fallback
+    unicode_re = re
+
+try:
+    import jieba
+except ImportError:  # pragma: no cover - optional dependency fallback
+    jieba = None
 
 
 STOPWORDS = {
     "the", "a", "an", "of", "in", "on", "for", "and", "or", "to", "by",
     "at", "from", "with", "without", "into", "over", "under", "after", "before",
 }
+ZH_STOPWORDS = {
+    "的", "了", "呢", "吗", "啊", "呀", "吧", "和", "与", "及", "或", "而", "被",
+    "在", "对", "把", "将", "向", "给", "跟", "还", "又", "也", "都", "就", "很",
+    "太", "更", "最", "这", "那", "这些", "那些", "一个", "一下", "一种", "一些",
+}
+_CJK_RE = unicode_re.compile(r"[\p{Script=Han}]")
+_LATIN_TOKEN_RE = unicode_re.compile(r"[\p{Latin}\d]+(?:[-_'][\p{Latin}\d]+)*")
+_CJK_RUN_RE = unicode_re.compile(r"[\p{Script=Han}]+")
+_EDGE_PUNCT_RE = unicode_re.compile(r"^[\p{P}\p{S}\s]+|[\p{P}\p{S}\s]+$")
+_TITLE_SPAN_RE = unicode_re.compile(r"[《“\"「](.{1,80}?)[》”\"」]")
+
+
+@lru_cache(maxsize=32768)
+def normalize_surface_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+@lru_cache(maxsize=32768)
+def contains_cjk(text: str) -> bool:
+    return bool(_CJK_RE.search(normalize_surface_text(text)))
+
+
+@lru_cache(maxsize=32768)
+def strip_edge_punctuation(text: str) -> str:
+    normalized = normalize_surface_text(text)
+    if not normalized:
+        return ""
+    stripped = _EDGE_PUNCT_RE.sub("", normalized)
+    return stripped.strip()
+
+
+def _tokenize_zh(text: str) -> list[str]:
+    normalized = normalize_surface_text(text)
+    if not normalized:
+        return []
+    if jieba is not None:
+        tokens = [str(token).strip() for token in jieba.lcut(normalized, HMM=False)]
+        return [token for token in tokens if token and strip_edge_punctuation(token)]
+    return [match.group(0) for match in _CJK_RUN_RE.finditer(normalized)]
+
+
+def _expand_cjk_subgrams(token: str, *, max_ngram: int) -> set[str]:
+    expanded: set[str] = set()
+    clean = strip_edge_punctuation(token)
+    if len(clean) < 2:
+        return expanded
+    upper = min(max_ngram, len(clean))
+    for size in range(2, upper + 1):
+        for index in range(0, len(clean) - size + 1):
+            expanded.add(clean[index : index + size])
+    return expanded
+
+
+@lru_cache(maxsize=32768)
+def language_aware_terms(
+    text: str,
+    *,
+    mode: str = "auto",
+    include_cjk_subgrams: bool = False,
+    max_cjk_ngram: int = 4,
+) -> tuple[str, ...]:
+    normalized = normalize_surface_text(text)
+    if not normalized:
+        return ()
+    resolved_mode = str(mode or "auto").strip().lower()
+    if resolved_mode == "auto":
+        resolved_mode = "zh" if contains_cjk(normalized) else "en"
+    tokens: set[str] = set()
+    for token in _LATIN_TOKEN_RE.findall(normalized.lower()):
+        if len(token) > 1:
+            tokens.add(token)
+    if resolved_mode == "zh":
+        if include_cjk_subgrams:
+            for run in _CJK_RUN_RE.findall(normalized):
+                clean_run = strip_edge_punctuation(run)
+                if clean_run and len(clean_run) >= 2:
+                    tokens.update(_expand_cjk_subgrams(clean_run, max_ngram=max_cjk_ngram))
+        for match in _TITLE_SPAN_RE.finditer(normalized):
+            title = strip_edge_punctuation(match.group(1))
+            if title and contains_cjk(title) and len(title) >= 2:
+                tokens.add(title)
+                if include_cjk_subgrams:
+                    tokens.update(_expand_cjk_subgrams(title, max_ngram=max_cjk_ngram))
+        for raw_token in _tokenize_zh(normalized):
+            token = strip_edge_punctuation(raw_token)
+            if not token or token in ZH_STOPWORDS:
+                continue
+            if contains_cjk(token):
+                if len(token) >= 2:
+                    tokens.add(token)
+                if include_cjk_subgrams:
+                    tokens.update(_expand_cjk_subgrams(token, max_ngram=max_cjk_ngram))
+            elif len(token) > 1:
+                tokens.add(token.lower())
+    else:
+        for token in re.findall(r"[a-z0-9]+", normalized.lower()):
+            if len(token) > 2 and token not in STOPWORDS:
+                tokens.add(token)
+    return tuple(sorted(tokens))
 
 
 @lru_cache(maxsize=32768)
 def normalize_text(text: str) -> str:
-    lowered = str(text).strip().lower()
+    lowered = normalize_surface_text(text).lower()
     lowered = lowered.replace("_", " ")
     lowered = re.sub(r"\([^)]*\)", " ", lowered)
-    lowered = re.sub(r"[^a-z0-9\s-]", " ", lowered)
+    lowered = re.sub(r"[^a-z0-9\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\s-]", " ", lowered)
     lowered = re.sub(r"\s+", " ", lowered).strip()
     return lowered
 

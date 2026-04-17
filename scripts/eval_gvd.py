@@ -17,8 +17,14 @@ if str(SRC_ROOT) not in sys.path:
 
 from leaf.answer_view import build_compact_answer_view, render_answer_view_text, summarize_answer_view
 from leaf.clients import ChatClient, OpenAICompatError
-from leaf.grounding import is_inference_query
+from leaf.grounding import is_inference_query, is_temporal_query, query_tokens as make_query_tokens
+from leaf.normalize import contains_cjk, language_aware_terms, normalize_surface_text, strip_edge_punctuation
 from leaf.service import LEAFService
+
+try:
+    import regex as unicode_re
+except ImportError:  # pragma: no cover - optional dependency fallback
+    unicode_re = re
 
 LIST_QUERY_PATTERNS = (
     "what topics",
@@ -142,7 +148,7 @@ ANSWER_STOPWORDS = {
     "recently",
 }
 
-TITLE_HINT_PATTERNS = (
+TITLE_QUERY_PATTERNS = (
     "name",
     "novel",
     "book",
@@ -160,7 +166,7 @@ TITLE_HINT_PATTERNS = (
     "who",
 )
 
-EXACT_SHORT_HINT_PATTERNS = (
+EXACT_SHORT_QUERY_PATTERNS = (
     "what was its name",
     "what is its name",
     "what movie",
@@ -174,6 +180,82 @@ EXACT_SHORT_HINT_PATTERNS = (
     "what is my favorite",
     "what's my favorite",
 )
+
+ZH_LIST_QUERY_PATTERNS = (
+    "哪些",
+    "哪几",
+    "哪两",
+    "几个",
+    "几部",
+    "几本",
+    "几种",
+)
+
+ZH_LIST_TAIL_PATTERNS = (
+    "建议",
+    "方法",
+    "技巧",
+    "话题",
+    "书",
+    "书目",
+    "电影",
+    "比赛",
+    "菜系",
+    "地方",
+    "城市",
+    "项目",
+    "运动",
+    "问题",
+    "礼物",
+)
+
+ZH_TITLE_QUERY_PATTERNS = (
+    "名字",
+    "书",
+    "电影",
+    "歌曲",
+    "电视剧",
+    "展览",
+    "景点",
+    "地方",
+    "城市",
+    "国家",
+)
+
+ZH_EXACT_SHORT_QUERY_PATTERNS = (
+    "名字是",
+    "叫什么",
+    "它的名字",
+    "它是",
+    "哪个国家",
+    "哪个地方",
+    "哪个城市",
+    "什么颜色",
+    "它的颜色",
+    "哪一部电影",
+    "哪部电影",
+    "哪本书",
+    "哪本小说",
+    "哪一天",
+    "哪天",
+    "多少人",
+)
+
+ZH_SUPPORT_QUERY_PATTERNS = (
+    "为什么",
+    "问题",
+    "困难",
+    "建议",
+    "方法",
+    "技巧",
+    "话题",
+    "灵感",
+    "怎么",
+    "如何",
+)
+
+TITLE_SPAN_RE = unicode_re.compile(r"[《“\"「](.{1,60}?)[》”\"」]")
+NUMBER_SPAN_RE = unicode_re.compile(r"(?:大约|约|大概)?\s*([一二两三四五六七八九十百千万0-9]+)\s*(?:个人左右|人左右|个人|人)")
 
 
 def estimate_text_tokens(text: str) -> int:
@@ -210,14 +292,19 @@ def sanitize_persona_name(name: str) -> str:
 
 
 def has_explicit_date(question: str) -> bool:
-    lowered = str(question or "").strip().lower()
-    return any(month in lowered for month in MONTH_NAMES) and bool(
-        re.search(r"\b\d{1,2}(?:st|nd|rd|th)?\b", lowered)
-    )
+    text = normalize_surface_text(question)
+    lowered = text.lower()
+    if any(month in lowered for month in MONTH_NAMES) and bool(re.search(r"\b\d{1,2}(?:st|nd|rd|th)?\b", lowered)):
+        return True
+    return bool(re.search(r"(19|20)\d{2}年\d{1,2}月\d{1,2}[日号]?|\d{1,2}月\d{1,2}[日号]?", text))
 
 
 def target_month_day(question: str) -> str | None:
-    lowered = str(question or "").strip().lower()
+    text = normalize_surface_text(question)
+    lowered = text.lower()
+    zh_match = re.search(r"(?:(19|20)\d{2}年)?(\d{1,2})月(\d{1,2})[日号]?", text)
+    if zh_match:
+        return f"{int(zh_match.group(2)):02d}-{int(zh_match.group(3)):02d}"
     for month_index, month in enumerate(MONTH_NAMES, start=1):
         if month not in lowered:
             continue
@@ -230,18 +317,33 @@ def target_month_day(question: str) -> str | None:
 
 
 def is_list_query(question: str) -> bool:
-    lowered = str(question or "").strip().lower()
-    return any(pattern in lowered for pattern in LIST_QUERY_PATTERNS)
+    text = normalize_surface_text(question)
+    lowered = text.lower()
+    if any(pattern in lowered for pattern in LIST_QUERY_PATTERNS):
+        return True
+    if any(pattern in text for pattern in ZH_LIST_QUERY_PATTERNS):
+        return True
+    return bool(re.search(r"什么.*(" + "|".join(re.escape(token) for token in ZH_LIST_TAIL_PATTERNS) + r")", text))
 
 
 def is_yes_no_query(question: str) -> bool:
-    lowered = str(question or "").strip().lower()
-    return bool(lowered) and (lowered.startswith(YES_NO_PREFIXES) or lowered.endswith("right?") or ", right?" in lowered)
+    text = normalize_surface_text(question)
+    lowered = text.lower()
+    if bool(lowered) and (lowered.startswith(YES_NO_PREFIXES) or lowered.endswith("right?") or ", right?" in lowered):
+        return True
+    return bool(re.search(r"(对吗|是吗|是不是|有没有|是否|会不会|还记得.*吗|记得.*吗)[\?？]?$", text))
 
 
 def use_exact_short_mode(question: str) -> bool:
-    lowered = str(question or "").strip().lower()
-    if not lowered or is_inference_query(question) or is_list_query(question):
+    text = normalize_surface_text(question)
+    lowered = text.lower()
+    if not lowered or is_inference_query(question):
+        return False
+    if contains_cjk(text):
+        if any(token in text for token in ["建议", "方法", "技巧", "怎么", "如何", "为什么", "话题", "具体的做法", "主要内容"]):
+            return False
+        return is_yes_no_query(text) or is_single_fact_query(text) or any(pattern in text for pattern in ZH_EXACT_SHORT_QUERY_PATTERNS)
+    if is_list_query(question):
         return False
     if any(
         token in lowered
@@ -267,20 +369,23 @@ def use_exact_short_mode(question: str) -> bool:
         return False
     if is_yes_no_query(question):
         return True
-    return any(pattern in lowered for pattern in EXACT_SHORT_HINT_PATTERNS)
+    return any(pattern in lowered for pattern in EXACT_SHORT_QUERY_PATTERNS)
 
 
 def answer_query_terms(question: str) -> set[str]:
-    tokens = {
-        token
-        for token in re.sub(r"[^a-z0-9\s]", " ", str(question or "").lower()).split()
-        if len(token) > 2 and token not in ANSWER_STOPWORDS
-    }
-    return tokens
+    text = normalize_surface_text(question)
+    mode = "zh" if contains_cjk(text) else "en"
+    tokens = set(language_aware_terms(text, mode=mode, include_cjk_subgrams=False))
+    tokens.update(token for token in make_query_tokens(text) if token not in ANSWER_STOPWORDS)
+    tokens = {token for token in tokens if token not in ANSWER_STOPWORDS}
+    if contains_cjk(text):
+        return tokens
+    return {token for token in tokens if len(token) > 2}
 
 
 def score_context_line(question: str, line: str) -> float:
-    lowered_question = str(question or "").lower()
+    question_text = str(question or "")
+    lowered_question = question_text.lower()
     lowered_line = str(line or "").lower()
     if not lowered_line.strip():
         return 0.0
@@ -293,25 +398,50 @@ def score_context_line(question: str, line: str) -> float:
         date = target_month_day(question)
         if date and f"-{date}" in lowered_line:
             score += 0.7
-    if any(pattern in lowered_question for pattern in TITLE_HINT_PATTERNS):
+    if any(pattern in lowered_question for pattern in TITLE_QUERY_PATTERNS):
         if '"' in line or "'" in line:
             score += 0.35
         if ":" in line:
             score += 0.05
+    if contains_cjk(question_text) and any(pattern in question_text for pattern in ZH_TITLE_QUERY_PATTERNS):
+        if any(marker in str(line or "") for marker in ["《", "》", "“", "”", "「", "」"]):
+            score += 0.35
+        if "：" in str(line or "") or ":" in str(line or ""):
+            score += 0.05
     if is_yes_no_query(question):
-        if "yes" in lowered_line or "no" in lowered_line or "like" in lowered_line or "don't like" in lowered_line:
+        if (
+            "yes" in lowered_line
+            or "no" in lowered_line
+            or "like" in lowered_line
+            or "don't like" in lowered_line
+            or any(token in str(line or "") for token in ["对", "不对", "不是", "喜欢", "不喜欢", "讨厌"])
+        ):
             score += 0.2
-    if "favorite" in lowered_question and "favorite" in lowered_line:
+    if ("favorite" in lowered_question and "favorite" in lowered_line) or ("最喜欢" in question_text and "最喜欢" in str(line or "")):
         score += 0.25
-    if "plan" in lowered_question and "travel" in lowered_line:
+    if ("plan" in lowered_question and "travel" in lowered_line) or ("计划" in question_text and any(token in str(line or "") for token in ["计划", "打算", "想去"])):
         score += 0.15
-    if "problem" in lowered_question and "problem" in lowered_line:
+    if ("problem" in lowered_question and "problem" in lowered_line) or ("问题" in question_text and "问题" in str(line or "")):
         score += 0.15
     return score
 
 
 def normalize_context_text(text: str) -> str:
-    return " ".join(str(text or "").strip().split())
+    return normalize_surface_text(text)
+
+
+def strip_context_prefix(line: str) -> str:
+    text = normalize_context_text(line)
+    text = re.sub(r"^\[[^\]]+\]\s*", "", text)
+    text = re.sub(r"^[^:：]{1,40}[:：]\s*", "", text)
+    return text.strip()
+
+
+def clean_answer_phrase(text: str) -> str:
+    value = normalize_context_text(text)
+    value = strip_edge_punctuation(value)
+    value = re.sub(r"^(是|就是|应该是)\s*", "", value)
+    return value.strip()
 
 
 def dedupe_preserve_order(lines: list[str]) -> list[str]:
@@ -342,6 +472,243 @@ def extract_answer_view_lines(answer_view: dict[str, Any], key: str) -> list[str
     return dedupe_preserve_order(lines)
 
 
+def trim_display_line(text: str, max_chars: int = 220) -> str:
+    compact = normalize_context_text(text)
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max(0, max_chars - 3)].rstrip() + "..."
+
+
+def line_has_temporal_signal(line: str) -> bool:
+    text = str(line or "").strip()
+    lowered = text.lower()
+    if not lowered:
+        return False
+    if re.search(r"\b(19|20)\d{2}\b", lowered):
+        return True
+    if re.search(r"\b\d{1,2}:\d{2}\b", lowered):
+        return True
+    if re.search(r"\b\d{4}-\d{2}-\d{2}\b", lowered):
+        return True
+    if re.search(r"(19|20)\d{2}年|\d{1,2}月\d{1,2}[日号]?", text):
+        return True
+    if any(month in lowered for month in MONTH_NAMES):
+        return True
+    return any(
+        token in lowered or token in text
+        for token in [
+            "today",
+            "yesterday",
+            "tomorrow",
+            "last week",
+            "last weekend",
+            "this week",
+            "next week",
+            "last month",
+            "this month",
+            "monday",
+            "tuesday",
+            "wednesday",
+            "thursday",
+            "friday",
+            "saturday",
+            "sunday",
+            "今天",
+            "昨天",
+            "前天",
+            "那天",
+            "当时",
+            "上周",
+            "本周",
+            "这周",
+            "下周",
+            "上周末",
+        ]
+    )
+
+
+def score_heuristic_bucket_line(question: str, line: str, *, bucket: str) -> float:
+    score = score_context_line(question, line)
+    question_text = str(question or "").strip()
+    line_text = str(line or "").strip()
+    lowered = str(line or "").strip().lower()
+    if not lowered:
+        return score
+    if bucket == "direct":
+        if line_supports_exact_answer(question, line):
+            score += 0.45
+        if "?" in line_text or "？" in line_text:
+            score -= 0.3
+        if re.match(r"^\[[^\]]+\]\s+", str(line or "").strip()):
+            score += 0.08
+        if ":" in line:
+            score += 0.04
+        if contains_cjk(question_text):
+            if "多少" in question_text and re.search(r"[一二两三四五六七八九十百千万0-9]+(个|人|位|名)", line_text):
+                score += 0.5
+            if any(token in question_text for token in ["哪个国家", "什么国家", "哪个地方", "什么地方", "哪里", "哪儿"]):
+                if any(token in line_text for token in ["去", "在", "附近", "海滩", "山", "湖", "公园", "国家", "城市"]):
+                    score += 0.25
+            if "话题" in question_text or "聊了什么" in question_text:
+                if any(token in line_text for token in ["你好", "很高兴", "朋友", "谢谢", "好朋友", "聆听"]):
+                    score -= 0.25
+                elif len(line_text) >= 24 and "？" not in line_text and "?" not in line_text:
+                    score += 0.12
+    elif bucket == "fact":
+        if any(token in lowered for token in ["favorite", "plan", "goal", "problem", "issue", "career", "study", "want", "wants to"]):
+            score += 0.18
+        if is_inference_query(question):
+            score += 0.12
+    elif bucket == "page":
+        if any(token in lowered for token in ["summary:", "context", "overlap"]):
+            score -= 0.04
+    elif bucket == "temporal":
+        if line_has_temporal_signal(line):
+            score += 0.3
+        if has_explicit_date(question):
+            date = target_month_day(question)
+            if date and line_date_token(line) == date:
+                score += 0.5
+    elif bucket == "relation":
+        if " " in lowered:
+            score += 0.05
+    return score
+
+
+def select_diverse_scored_lines(
+    question: str,
+    candidates: list[str],
+    *,
+    bucket: str,
+    limit: int,
+    anchor_session: str | None = None,
+) -> list[str]:
+    scored: list[tuple[float, int, str, str | None]] = []
+    for index, line in enumerate(dedupe_preserve_order(candidates)):
+        compact = trim_display_line(line)
+        if not compact:
+            continue
+        score = score_heuristic_bucket_line(question, compact, bucket=bucket)
+        session_id = extract_session_id_from_context_line(compact)
+        if anchor_session and session_id == anchor_session and bucket in {"direct", "temporal"}:
+            score += 0.08
+        scored.append((score, index, compact, session_id))
+    scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+
+    selected: list[str] = []
+    selected_sessions: set[str] = set()
+    selected_norms: list[set[str]] = []
+    for score, _, compact, session_id in scored:
+        norm_terms = answer_query_terms(compact)
+        redundancy = 0.0
+        for existing_terms in selected_norms:
+            overlap = len(norm_terms.intersection(existing_terms))
+            redundancy = max(redundancy, overlap * 0.03)
+        adjusted = score - redundancy
+        if adjusted <= 0 and selected:
+            continue
+        if session_id and session_id in selected_sessions and bucket in {"direct", "temporal"} and len(selected) >= max(2, limit - 1):
+            continue
+        selected.append(compact)
+        if session_id:
+            selected_sessions.add(session_id)
+        selected_norms.append(norm_terms)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def reshape_heuristic_answer_view_for_gvd(
+    question: str,
+    *,
+    answer_view: dict[str, Any],
+    context_lines: list[str],
+) -> dict[str, Any]:
+    if any(key in answer_view for key in ("direct_evidence", "entity_facts", "temporal_clues", "relation_paths", "page_context")):
+        return answer_view
+
+    raw_lines = dedupe_preserve_order(context_lines + extract_answer_view_lines(answer_view, "raw_evidence"))
+    fact_lines = extract_answer_view_lines(answer_view, "facts")
+    page_lines = extract_answer_view_lines(answer_view, "page_summaries")
+    relation_lines = extract_answer_view_lines(answer_view, "relations")
+
+    explicit_date = has_explicit_date(question)
+    inference_mode = is_inference_query(question)
+    list_query = is_list_query(question)
+    yes_no_query = is_yes_no_query(question)
+    single_fact_query = is_single_fact_query(question)
+
+    direct_seed_limit = 4 if (single_fact_query or yes_no_query) else 5 if list_query else 4
+    direct_evidence = select_diverse_scored_lines(
+        question,
+        raw_lines,
+        bucket="direct",
+        limit=direct_seed_limit,
+    )
+
+    anchor_session = extract_session_id_from_context_line(direct_evidence[0]) if direct_evidence else None
+    if anchor_session and (single_fact_query or yes_no_query):
+        same_session_lines = [
+            line
+            for line in raw_lines
+            if extract_session_id_from_context_line(line) == anchor_session
+        ]
+        anchored_direct = select_diverse_scored_lines(
+            question,
+            same_session_lines,
+            bucket="direct",
+            limit=direct_seed_limit,
+            anchor_session=anchor_session,
+        )
+        if len(anchored_direct) >= max(2, min(3, direct_seed_limit)):
+            direct_evidence = anchored_direct
+
+    temporal_sources = raw_lines + fact_lines + page_lines
+    temporal_clues = select_diverse_scored_lines(
+        question,
+        [line for line in temporal_sources if line_has_temporal_signal(line)] or temporal_sources,
+        bucket="temporal",
+        limit=4 if explicit_date else 2,
+        anchor_session=anchor_session,
+    )
+
+    fact_sources = fact_lines + [line for line in page_lines if line not in fact_lines]
+    entity_facts = select_diverse_scored_lines(
+        question,
+        fact_sources,
+        bucket="fact",
+        limit=5 if inference_mode else 4 if list_query else 3,
+        anchor_session=anchor_session,
+    )
+
+    page_context = select_diverse_scored_lines(
+        question,
+        [line for line in page_lines if line not in entity_facts],
+        bucket="page",
+        limit=3 if inference_mode else 2,
+        anchor_session=anchor_session,
+    )
+
+    relation_paths = select_diverse_scored_lines(
+        question,
+        relation_lines,
+        bucket="relation",
+        limit=3 if list_query else 2,
+    )
+
+    reshaped = {
+        "direct_evidence": direct_evidence,
+        "entity_facts": entity_facts,
+        "temporal_clues": temporal_clues,
+        "relation_paths": relation_paths,
+        "page_context": page_context,
+        "insufficient": [],
+    }
+    if not any(reshaped[key] for key in ("direct_evidence", "entity_facts", "temporal_clues", "relation_paths", "page_context")):
+        reshaped["insufficient"] = ["No strong grounded evidence selected."]
+    return reshaped
+
+
 def line_date_token(line: str) -> str | None:
     text = str(line or "")
     match = re.search(r"\b(20\d{2})-(\d{2})-(\d{2})\b", text)
@@ -351,8 +718,10 @@ def line_date_token(line: str) -> str | None:
 
 
 def line_supports_exact_answer(question: str, line: str) -> bool:
-    lowered_question = str(question or "").strip().lower()
-    lowered_line = str(line or "").strip().lower()
+    question_text = str(question or "").strip()
+    lowered_question = question_text.lower()
+    line_text = str(line or "")
+    lowered_line = line_text.strip().lower()
     if not lowered_line:
         return False
     if is_yes_no_query(question):
@@ -370,12 +739,19 @@ def line_supports_exact_answer(question: str, line: str) -> bool:
             "enjoyed",
             "dislike",
             "hate",
+            "喜欢",
+            "不喜欢",
+            "不对",
+            "不是",
+            "讨厌",
         ]
         return any(marker in f" {lowered_line} " for marker in polarity_markers)
-    if any(pattern in lowered_question for pattern in TITLE_HINT_PATTERNS):
-        if '"' in line or "'" in line:
+    if any(pattern in lowered_question for pattern in TITLE_QUERY_PATTERNS) or any(
+        pattern in question_text for pattern in ZH_TITLE_QUERY_PATTERNS
+    ):
+        if any(marker in line_text for marker in ['"', "'", "《", "》", "“", "”", "「", "」"]):
             return True
-        if re.search(r"\b[A-Z][A-Za-z0-9'&-]+(?:\s+[A-Z][A-Za-z0-9'&-]+){0,6}\b", str(line or "")):
+        if re.search(r"\b[A-Z][A-Za-z0-9'&-]+(?:\s+[A-Z][A-Za-z0-9'&-]+){0,6}\b", line_text):
             return True
     if any(token in lowered_question for token in ["favorite", "problem", "issue", "inspired", "why", "what did i do"]):
         salient_markers = [
@@ -395,6 +771,11 @@ def line_supports_exact_answer(question: str, line: str) -> bool:
             "loved",
         ]
         return any(marker in lowered_line for marker in salient_markers)
+    if any(token in question_text for token in ["最喜欢", "问题", "困难", "灵感", "为什么", "做法"]):
+        return any(
+            marker in line_text
+            for marker in ["最喜欢", "问题", "困难", "因为", "由于", "灵感", "做法", "步骤", "推荐", "建议", "去了", "看了", "读了"]
+        )
     return score_context_line(question, line) >= 0.6
 
 
@@ -421,7 +802,7 @@ def select_short_answer_context(
         if dated:
             direct_lines = dated
     direct_scored = [
-        (score_context_line(question, line), index, normalize_context_text(line))
+        (score_heuristic_bucket_line(question, line, bucket="direct"), index, normalize_context_text(line))
         for index, line in enumerate(direct_lines)
         if normalize_context_text(line)
     ]
@@ -436,7 +817,9 @@ def select_short_answer_context(
     selected_direct = [item[2] for item in direct_scored[:max_direct]]
 
     support_lines: list[str] = []
-    if list_query or inference_mode or any(token in str(question or "").lower() for token in ["why", "problem", "issue", "inspired", "what did i do"]):
+    if list_query or inference_mode or any(
+        token in str(question or "").lower() for token in ["why", "problem", "issue", "inspired", "what did i do"]
+    ) or any(token in str(question or "") for token in ZH_SUPPORT_QUERY_PATTERNS):
         support_lines.extend(extract_answer_view_lines(answer_view, "entity_facts")[:2])
     if explicit_date:
         support_lines.extend(extract_answer_view_lines(answer_view, "temporal_clues")[:1])
@@ -464,11 +847,178 @@ def select_short_answer_context(
     }
 
 
+def extract_structured_answer_from_context(
+    question: str,
+    *,
+    answer_view: dict[str, Any],
+    context_lines: list[str],
+    language_mode: str,
+) -> str | None:
+    if language_mode != "zh":
+        return None
+
+    def normalize_place_answer(text: str) -> str:
+        candidate = clean_answer_phrase(text)
+        if not candidate:
+            return ""
+        candidate = re.split(r"[，,。；;！？!?]", candidate, maxsplit=1)[0].strip()
+        candidate = re.sub(r"(旅行|旅游|游玩|度假|玩儿|玩)$", "", candidate).strip()
+        candidate = re.sub(r"(的)?(地方|城市|国家)$", "", candidate).strip()
+        if not candidate:
+            return ""
+        if re.search(r"(哪里|哪儿|哪个|什么地方|什么城市|什么国家|何处)", candidate):
+            return ""
+        return candidate
+
+    direct_lines = extract_answer_view_lines(answer_view, "direct_evidence")
+    base_lines = filter_context_lines_for_question(question, list(context_lines))
+    if direct_lines:
+        merged_lines = dedupe_preserve_order(direct_lines + base_lines)
+    else:
+        merged_lines = base_lines
+    if not merged_lines:
+        return None
+
+    explicit_date = has_explicit_date(question)
+    month_day = target_month_day(question)
+    if explicit_date and month_day is not None:
+        dated = [line for line in merged_lines if line_date_token(line) == month_day]
+        if dated:
+            merged_lines = dated
+
+    line_rows: list[dict[str, Any]] = []
+    for index, line in enumerate(merged_lines):
+        payload = strip_context_prefix(line)
+        if not payload:
+            continue
+        line_rows.append(
+            {
+                "raw": line,
+                "payload": payload,
+                "index": index,
+                "is_assistant": "AI Companion:" in line,
+            }
+        )
+    if not line_rows:
+        return None
+
+    question_text = str(question or "").strip()
+    list_query = is_list_query(question_text)
+    prefers_user_statement = bool(
+        contains_cjk(question_text)
+        and (
+            question_text.startswith("我")
+            or "我" in question_text
+            or "我的" in question_text
+            or "我们" in question_text
+        )
+    )
+
+    if is_yes_no_query(question_text):
+        negative_match = re.search(r"我不喜欢(.+?)(?:，|,|。|\?|？|对吗|是吗|是不是|有没有|是否|会不会)", question_text)
+        if negative_match:
+            target = clean_answer_phrase(negative_match.group(1))
+            for row in line_rows:
+                payload = str(row["payload"])
+                if target and target in payload and "喜欢" in payload and "不喜欢" not in payload:
+                    return f"不对，你喜欢{target}"
+        generic_negative_match = re.search(r"不是(.+?)(?:，|,|。|\?|？|对吗|是吗|是不是|有没有|是否|会不会)", question_text)
+        if generic_negative_match:
+            target = clean_answer_phrase(generic_negative_match.group(1))
+            for row in line_rows:
+                payload = str(row["payload"])
+                if target and target in payload:
+                    return f"不是，{target}"
+
+    if "多少人" in question_text or "几个人" in question_text or "人数" in question_text:
+        for row in line_rows:
+            payload = str(row["payload"])
+            match = NUMBER_SPAN_RE.search(payload)
+            if match:
+                phrase = clean_answer_phrase(match.group(0))
+                if phrase:
+                    return phrase
+
+    title_like_query = any(
+        token in question_text
+        for token in [
+            "哪本书",
+            "哪本小说",
+            "哪部电影",
+            "哪一部电影",
+            "什么歌",
+            "最喜欢他的什么歌",
+            "它的名字",
+            "名字是",
+            "叫什么",
+        ]
+    ) or bool(re.search(r"(哪|什么).*(书|小说|电影|歌曲|歌|名字)|最喜欢.*歌", question_text))
+    if title_like_query and not list_query:
+        title_candidates: list[tuple[float, str]] = []
+        for row in line_rows:
+            payload = str(row["payload"])
+            base_score = score_context_line(question_text, payload) + max(0.0, 0.2 - int(row["index"]) * 0.02)
+            if prefers_user_statement and not bool(row["is_assistant"]):
+                base_score += 0.18
+            if "书" in question_text and not any(token in payload for token in ["书", "小说", "读", "买"]):
+                base_score -= 0.18
+            if "电影" in question_text and "电影" not in payload and "片" not in payload:
+                base_score -= 0.18
+            if "歌" in question_text and not any(token in payload for token in ["歌", "歌曲", "演唱会", "最喜欢"]):
+                base_score -= 0.18
+            if "名字" in question_text and not any(token in payload for token in ["叫做", "名叫", "名字", "是《"]):
+                base_score -= 0.12
+            for match in TITLE_SPAN_RE.finditer(payload):
+                title = clean_answer_phrase(match.group(1))
+                if not title:
+                    continue
+                score = base_score
+                left_context = payload[: match.start()]
+                if "最喜欢" in left_context:
+                    score += 0.25
+                if any(token in left_context for token in ["推荐", "看了", "读了", "分享", "提到"]):
+                    score += 0.12
+                if any(token in payload for token in ["我看的是", "我买了一本", "我去看了", "我读了", "我分享过"]):
+                    score += 0.22
+                title_candidates.append((score, f"《{title}》"))
+        if title_candidates:
+            title_candidates.sort(key=lambda item: item[0], reverse=True)
+            seen: set[str] = set()
+            ordered_titles: list[str] = []
+            for _, title in title_candidates:
+                if title in seen:
+                    continue
+                seen.add(title)
+                ordered_titles.append(title)
+            return ordered_titles[0]
+
+    if any(token in question_text for token in ["哪个国家", "什么国家", "哪个城市", "什么城市", "哪个地方", "什么地方", "哪里", "哪儿"]):
+        fact_payloads = [
+            strip_context_prefix(line)
+            for line in extract_answer_view_lines(answer_view, "entity_facts")
+        ]
+        search_payloads = [str(row["payload"]) for row in line_rows] + [payload for payload in fact_payloads if payload]
+        for payload in search_payloads:
+            patterns = [
+                r"(?:计划去|打算去|想去|准备去)([^，。；！？\s]{1,20})",
+                r"(?:想去|计划去|打算去|准备去)[^，。；！？]{0,20}?([一-龥]{2,12})(?:旅行|旅游|游玩|度假)",
+                r"(?:去了|去过)([^，。；！？\s]{1,20})",
+                r"在(.{1,20}?)拍摄",
+            ]
+            for pattern in patterns:
+                for match in re.finditer(pattern, payload):
+                    candidate = normalize_place_answer(match.group(1))
+                    if candidate:
+                        return candidate
+
+    return None
+
+
 def prioritize_answer_context(question: str, context_lines: list[str]) -> tuple[list[str], float]:
     if not context_lines:
         return [], 0.0
     scored = [
-        (score_context_line(question, line), index, line)
+        (score_heuristic_bucket_line(question, line, bucket="direct"), index, line)
         for index, line in enumerate(context_lines)
     ]
     scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
@@ -485,7 +1035,8 @@ def prioritize_answer_context(question: str, context_lines: list[str]) -> tuple[
 
 
 def is_single_fact_query(question: str) -> bool:
-    lowered = str(question or "").strip().lower()
+    text = str(question or "").strip()
+    lowered = text.lower()
     if not lowered:
         return False
     if is_list_query(lowered):
@@ -494,6 +1045,11 @@ def is_single_fact_query(question: str) -> bool:
         return True
     if any(pattern in lowered for pattern in SINGLE_FACT_PATTERNS):
         return True
+    if contains_cjk(text):
+        if any(pattern in text for pattern in ZH_EXACT_SHORT_QUERY_PATTERNS):
+            return True
+        if re.search(r"(哪个|哪座|哪部|哪本|哪里|哪天|谁|多少人|什么颜色|什么地方|什么国家|什么城市|名字是|叫什么)", text):
+            return True
     return bool(re.search(r"\b(what\s+(is|was)|where|which|who|when)\b", lowered))
 
 
@@ -622,8 +1178,9 @@ def session_sort_key(session_id: str | None) -> tuple[int, str]:
 def filter_context_lines_for_question(question: str, context_lines: list[str]) -> list[str]:
     if not context_lines:
         return context_lines
-    lowered = str(question or "").strip().lower()
-    if "first conversation" in lowered:
+    text = str(question or "").strip()
+    lowered = text.lower()
+    if "first conversation" in lowered or any(token in text for token in ["第一次对话", "第一次聊天", "最开始的对话"]):
         session_ids = [extract_session_id_from_context_line(line) for line in context_lines]
         dated_sessions = sorted({sid for sid in session_ids if sid}, key=session_sort_key)
         if dated_sessions:
@@ -631,7 +1188,9 @@ def filter_context_lines_for_question(question: str, context_lines: list[str]) -
             first_lines = [line for line in context_lines if extract_session_id_from_context_line(line) == first_session]
             if first_lines:
                 return first_lines
-    if any(token in lowered for token in ["last conversation", "most recent conversation", "latest conversation"]):
+    if any(token in lowered for token in ["last conversation", "most recent conversation", "latest conversation"]) or any(
+        token in text for token in ["最后一次对话", "最近一次对话", "最新一次对话"]
+    ):
         session_ids = [extract_session_id_from_context_line(line) for line in context_lines]
         dated_sessions = sorted({sid for sid in session_ids if sid}, key=session_sort_key)
         if dated_sessions:
@@ -650,9 +1209,12 @@ def build_answer_messages(
     context_lines: list[str] | None = None,
     answer_view_text: str | None = None,
     answer_view: dict[str, Any] | None = None,
+    language_mode: str = "en",
 ) -> list[dict[str, str]]:
     context_lines = context_lines if context_lines is not None else build_answer_context_lines(evidence)
-    exact_short_mode = answer_style == "short" and use_exact_short_mode(question)
+    exact_short_mode = answer_style == "short" and (
+        use_exact_short_mode(question) or (language_mode == "zh" and is_list_query(question))
+    )
     single_fact_query = is_single_fact_query(question)
     explicit_date = has_explicit_date(question)
     yes_no_query = is_yes_no_query(question)
@@ -669,6 +1231,29 @@ def build_answer_messages(
         same_day_lines = [line for line in context_lines if f"-{month_day}" in line]
         if same_day_lines:
             context_lines = same_day_lines
+    if (
+        language_mode == "zh"
+        and explicit_date
+        and month_day is not None
+        and any(token in str(question or "") for token in ["聊了什么话题", "什么话题"])
+    ):
+        same_day_spans = [
+            span
+            for span in (evidence.get("raw_spans") or [])
+            if line_date_token(str(span.get("timestamp") or "")) == month_day
+        ]
+        same_day_spans.sort(key=lambda span: int(span.get("turn_index") or 0))
+        topical_lines: list[str] = []
+        for span in same_day_spans:
+            text = normalize_context_text(span.get("text") or "")
+            if not text:
+                continue
+            if any(token in text for token in ["你好", "很高兴", "好朋友", "下次再聊", "谢谢你的分享"]):
+                continue
+            speaker = str(span.get("speaker") or "").strip()
+            topical_lines.append(f"[{span.get('timestamp')}] {speaker}: {text}")
+        if topical_lines:
+            context_lines = topical_lines[:6]
     if answer_style == "judge_aligned":
         context_lines = filter_context_lines_for_question(question, context_lines)
         prioritized_lines, top_support_score = prioritize_answer_context(question, context_lines)
@@ -687,6 +1272,8 @@ def build_answer_messages(
         top_support_score = 0.0
         context = "\n".join(context_lines).strip()
     context = context.strip() or "(no retrieved evidence)"
+    if language_mode == "zh":
+        context = context.replace("[Direct Evidence]", "[直接证据]").replace("[Supporting Facts]", "[补充事实]")
     if answer_style == "judge_aligned" and inference_mode:
         instruction_parts = [
             "Answer the question using only the provided evidence.",
@@ -701,7 +1288,7 @@ def build_answer_messages(
         instruction_parts = [
             "Answer the question using only the provided evidence.",
             "The evidence is organized into sectioned text lists such as Direct Evidence, Facts, Timeline, Relations, Context, and Insufficient.",
-            "Treat Direct Evidence as the strongest grounded snippets, Facts as distilled memory statements, Timeline as time anchors, Relations as graph hints, and Context as high-level support.",
+            "Treat Direct Evidence as the strongest grounded snippets, Facts as distilled memory statements, Timeline as time anchors, Relations as graph relations, and Context as high-level support.",
             "Prefer Direct Evidence when it directly answers the question, otherwise combine Facts with Timeline and Context.",
             "If the evidence is insufficient, answer UNKNOWN.",
             "Resolve relative time references into absolute dates or times when the evidence allows.",
@@ -788,6 +1375,11 @@ def build_answer_messages(
         instruction_parts.append(
             "If the question asks for steps, advice, problems, or discussed topics, include every directly supported key point and avoid underspecified summaries like 'some difficulties'."
         )
+    if language_mode == "zh":
+        instruction_parts.append("Answer in concise Chinese and prefer directly copied short phrases from the evidence.")
+        instruction_parts.append("Do not restate the full question or the speaker unless needed for disambiguation.")
+        if yes_no_query:
+            instruction_parts.append("For Chinese confirmation questions, prefer compact forms like '不对，户外运动' or '不是'.")
     return [
         {
             "role": "system",
@@ -810,6 +1402,7 @@ def build_unknown_recovery_messages(
     focused_context: str,
     yes_no_query: bool,
     list_query: bool,
+    language_mode: str = "en",
 ) -> list[dict[str, str]]:
     instruction_parts = [
         "Extract the answer from the provided direct evidence only.",
@@ -823,6 +1416,8 @@ def build_unknown_recovery_messages(
         instruction_parts.append("If the answer is No, briefly state the corrected fact rather than repeating the false wording from the question.")
     if list_query:
         instruction_parts.append("For list questions, include only the items directly stated in the evidence and nothing extra.")
+    if language_mode == "zh":
+        instruction_parts.append("Answer in concise Chinese and copy the shortest supported phrase directly from the evidence.")
     return [
         {"role": "system", "content": " ".join(instruction_parts)},
         {
@@ -840,6 +1435,7 @@ def build_revision_messages(
     *,
     candidate_answer: str,
     evidence_text: str,
+    language_mode: str = "en",
 ) -> list[dict[str, str]]:
     lowered = str(question or "").strip().lower()
     instruction_parts = [
@@ -858,6 +1454,8 @@ def build_revision_messages(
         instruction_parts.append("Respect the exact date in the question. Do not substitute nearby dates.")
     if "first conversation" in lowered:
         instruction_parts.append("Focus on the earliest conversation only.")
+    if language_mode == "zh":
+        instruction_parts.append("Keep the final answer as a concise Chinese phrase and avoid restating the full question.")
     return [
         {
             "role": "system",
@@ -951,6 +1549,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--question-limit", type=int, default=0)
     parser.add_argument("--snapshot-limit", type=int, default=6)
     parser.add_argument("--raw-span-limit", type=int, default=8)
+    parser.add_argument("--answer-view-mode", choices=["heuristic", "extractive"], default="heuristic")
     parser.add_argument("--ingest-mode", choices=["online", "migration"], default=None)
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--judge-with-llm", action="store_true")
@@ -978,6 +1577,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     service = LEAFService(config_path=args.config, db_path=args.db)
+    language_mode = str((service.config.language.mode if service.config.language is not None else "en") or "en").strip().lower()
     judge_client = ChatClient(service.config.llm) if args.judge_with_llm and service.config.llm.base_url else None
     try:
         if not args.ingest_mode:
@@ -1039,8 +1639,23 @@ def main() -> None:
                 search_elapsed_ms = (time.perf_counter() - search_started) * 1000.0
 
                 context_lines = build_answer_context_lines(evidence)
-                answer_view = build_compact_answer_view(question=question, evidence=evidence)
-                answer_view_text = render_answer_view_text(question=question, answer_view=answer_view)
+                answer_view = build_compact_answer_view(
+                    question=question,
+                    evidence=evidence,
+                    mode=args.answer_view_mode,
+                    language_mode=language_mode,
+                )
+                if args.answer_view_mode == "heuristic":
+                    answer_view = reshape_heuristic_answer_view_for_gvd(
+                        question,
+                        answer_view=answer_view,
+                        context_lines=context_lines,
+                    )
+                answer_view_text = render_answer_view_text(
+                    question=question,
+                    answer_view=answer_view,
+                    language_mode=language_mode,
+                )
                 answer_messages = build_answer_messages(
                     question=question,
                     evidence=evidence,
@@ -1048,17 +1663,28 @@ def main() -> None:
                     context_lines=context_lines,
                     answer_view_text=answer_view_text,
                     answer_view=answer_view,
+                    language_mode=language_mode,
                 )
                 answer_input_tokens_est = estimate_message_tokens(answer_messages)
                 answer_started = time.perf_counter()
                 unknown_recovery_triggered = False
                 unknown_recovery_used = False
+                deterministic_answer_used = False
                 answer_llm_call_count = 0
                 try:
                     answer_max_tokens = 96 if is_inference_query(question) else 80
-                    predicted_answer = service.llm.text(answer_messages, max_tokens=answer_max_tokens, temperature=0.0).strip() if service.llm else ""
-                    if service.llm:
-                        answer_llm_call_count += 1
+                    predicted_answer = extract_structured_answer_from_context(
+                        question,
+                        answer_view=answer_view,
+                        context_lines=context_lines,
+                        language_mode=language_mode,
+                    )
+                    if predicted_answer:
+                        deterministic_answer_used = True
+                    else:
+                        predicted_answer = service.llm.text(answer_messages, max_tokens=answer_max_tokens, temperature=0.0).strip() if service.llm else ""
+                        if service.llm:
+                            answer_llm_call_count += 1
                     if (
                         args.unknown_recovery == "direct_clue"
                         and
@@ -1080,6 +1706,7 @@ def main() -> None:
                                 focused_context=focused_context,
                                 yes_no_query=is_yes_no_query(question),
                                 list_query=is_list_query(question),
+                                language_mode=language_mode,
                             )
                             answer_input_tokens_est += estimate_message_tokens(recovery_messages)
                             recovered_answer = service.llm.text(
@@ -1101,6 +1728,7 @@ def main() -> None:
                             question=question,
                             candidate_answer=predicted_answer,
                             evidence_text=answer_view_text,
+                            language_mode=language_mode,
                         )
                         answer_input_tokens_est += estimate_message_tokens(revision_messages)
                         revised_answer = service.llm.text(revision_messages, max_tokens=answer_max_tokens, temperature=0.0).strip()
@@ -1150,6 +1778,7 @@ def main() -> None:
                         "unknown_recovery": args.unknown_recovery,
                         "unknown_recovery_triggered": unknown_recovery_triggered,
                         "unknown_recovery_used": unknown_recovery_used,
+                        "deterministic_answer_used": deterministic_answer_used,
                         "answer_llm_call_count": answer_llm_call_count,
                         "raw_span_count": len(evidence.get("raw_spans") or []),
                         "answer_context_line_count": len(context_lines),
@@ -1247,6 +1876,7 @@ def main() -> None:
             "question_limit": args.question_limit,
             "judge_with_llm": args.judge_with_llm,
             "answer_style": args.answer_style,
+            "answer_view_mode": args.answer_view_mode,
             "answer_revision": args.answer_revision,
             "unknown_recovery": args.unknown_recovery,
             "summary": summary,

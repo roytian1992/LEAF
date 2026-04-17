@@ -4,6 +4,8 @@ from datetime import datetime, timedelta
 import re
 from typing import Any
 
+from .normalize import language_aware_terms, normalize_surface_text
+
 MONTH_NAMES = {
     1: "January",
     2: "February",
@@ -52,6 +54,45 @@ NUMBER_WORDS = {
     "nine": 9,
     "ten": 10,
 }
+
+ZH_NUMBER_WORDS = {
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+    "十": 10,
+}
+
+ZH_WEEKDAY_NAMES = {
+    "一": "Monday",
+    "二": "Tuesday",
+    "三": "Wednesday",
+    "四": "Thursday",
+    "五": "Friday",
+    "六": "Saturday",
+    "日": "Sunday",
+    "天": "Sunday",
+}
+
+_LANGUAGE_MODE = "en"
+
+
+def set_language_mode(mode: str) -> None:
+    global _LANGUAGE_MODE
+    normalized = str(mode or "en").strip().lower()
+    if normalized not in {"en", "zh"}:
+        raise ValueError(f"Unsupported language mode: {mode}")
+    _LANGUAGE_MODE = normalized
+
+
+def get_language_mode() -> str:
+    return _LANGUAGE_MODE
 
 WEEKDAY_PATTERN = r"(mon|monday|tue|tues|tuesday|wed|weds|wednesday|thu|thur|thurs|thursday|fri|friday|sat|saturday|sun|sunday)"
 
@@ -144,9 +185,107 @@ TEMPORAL_PATTERN_SPECS = (
         "kind": "last_weekday",
         "precision": "relative",
     },
+    {
+        "name": "zh_days_ago",
+        "pattern": re.compile(r"(?P<value>\d+|[一二两三四五六七八九十]+)天前"),
+        "kind": "days_ago",
+        "precision": "date",
+    },
+    {
+        "name": "zh_day_before_yesterday",
+        "pattern": re.compile(r"前天"),
+        "kind": "day_offset",
+        "precision": "date",
+        "offset_days": -2,
+    },
+    {
+        "name": "zh_yesterday",
+        "pattern": re.compile(r"昨天"),
+        "kind": "day_offset",
+        "precision": "date",
+        "offset_days": -1,
+    },
+    {
+        "name": "zh_today",
+        "pattern": re.compile(r"今天"),
+        "kind": "day_offset",
+        "precision": "date",
+        "offset_days": 0,
+    },
+    {
+        "name": "zh_last_year",
+        "pattern": re.compile(r"去年"),
+        "kind": "year_offset",
+        "precision": "year",
+        "offset_years": -1,
+    },
+    {
+        "name": "zh_this_year",
+        "pattern": re.compile(r"今年"),
+        "kind": "year_offset",
+        "precision": "year",
+        "offset_years": 0,
+    },
+    {
+        "name": "zh_last_month",
+        "pattern": re.compile(r"上个月"),
+        "kind": "month_offset",
+        "precision": "month",
+        "offset_months": -1,
+    },
+    {
+        "name": "zh_next_month",
+        "pattern": re.compile(r"下个月"),
+        "kind": "month_offset",
+        "precision": "month",
+        "offset_months": 1,
+    },
+    {
+        "name": "zh_this_month",
+        "pattern": re.compile(r"(这个月|本月)"),
+        "kind": "current_month",
+        "precision": "month",
+    },
+    {
+        "name": "zh_this_week",
+        "pattern": re.compile(r"(这周|本周)"),
+        "kind": "relative_label",
+        "precision": "relative",
+        "label": "week of",
+    },
+    {
+        "name": "zh_last_week",
+        "pattern": re.compile(r"上周"),
+        "kind": "relative_label",
+        "precision": "relative",
+        "label": "week before",
+    },
+    {
+        "name": "zh_next_week",
+        "pattern": re.compile(r"下周"),
+        "kind": "relative_label",
+        "precision": "relative",
+        "label": "week after",
+    },
+    {
+        "name": "zh_last_weekend",
+        "pattern": re.compile(r"上周末"),
+        "kind": "relative_label",
+        "precision": "relative",
+        "label": "weekend before",
+    },
+    {
+        "name": "zh_last_weekday",
+        "pattern": re.compile(r"上周(?P<weekday>[一二三四五六日天])"),
+        "kind": "last_weekday",
+        "precision": "relative",
+    },
 )
 
-TEMPORAL_QUERY_HINTS = {"when", "date", "day", "month", "year", "time"}
+TEMPORAL_QUERY_PATTERNS = {
+    "when", "date", "day", "month", "year", "time",
+    "什么时候", "哪天", "几月", "几号", "日期", "时间", "当天", "那天", "当时",
+}
 INFERENCE_QUERY_PATTERNS = (
     "would ",
     "likely",
@@ -164,6 +303,14 @@ INFERENCE_QUERY_PATTERNS = (
     "what pets",
     "how many",
     "is it likely",
+    "性格",
+    "特质",
+    "可能",
+    "会不会",
+    "倾向",
+    "职业",
+    "工作",
+    "领域",
 )
 
 
@@ -238,7 +385,7 @@ def _apply_temporal_pattern(
     precision = str(spec.get("precision") or "")
     if kind == "days_ago":
         raw_value = str((match.group("value") if match is not None else "") or "").strip().lower()
-        delta_days = int(raw_value) if raw_value.isdigit() else NUMBER_WORDS.get(raw_value)
+        delta_days = _parse_relative_number(raw_value)
         if delta_days is None:
             return payload
         grounded = anchor - timedelta(days=delta_days)
@@ -269,7 +416,7 @@ def _apply_temporal_pattern(
         return payload
     if kind == "last_weekday":
         weekday_key = str((match.group("weekday") if match is not None else "") or "").strip().lower()
-        weekday_name = WEEKDAY_NAMES.get(weekday_key)
+        weekday_name = WEEKDAY_NAMES.get(weekday_key) or ZH_WEEKDAY_NAMES.get(weekday_key)
         if not weekday_name:
             return payload
         payload["grounded_relative"] = f"{weekday_name} before {_relative_anchor_text(anchor)}"
@@ -316,7 +463,13 @@ def format_grounded_value(grounding: dict[str, Any]) -> str | None:
 
 def is_temporal_query(query: str) -> bool:
     lowered = str(query or "").lower()
-    return any(token in lowered.split() or token in lowered for token in TEMPORAL_QUERY_HINTS)
+    if any(token in lowered for token in TEMPORAL_QUERY_PATTERNS):
+        return True
+    return bool(
+        re.search(r"\b(19|20)\d{2}\b", lowered)
+        or re.search(r"(19|20)\d{2}年", str(query or ""))
+        or re.search(r"\d{1,2}月\d{1,2}[日号]?", str(query or ""))
+    )
 
 
 def is_inference_query(query: str) -> bool:
@@ -359,9 +512,14 @@ def canonicalize_temporal_answer(question: str, predicted_answer: str | None, ev
 
 
 def query_tokens(query: str) -> set[str]:
+    normalized = normalize_surface_text(query).lower()
+    if not normalized:
+        return set()
+    if get_language_mode() == "zh":
+        return _query_tokens_zh(normalized)
     return {
         token
-        for token in re.sub(r"[^a-z0-9\s]", " ", query.lower()).split()
+        for token in re.sub(r"[^a-z0-9\s]", " ", normalized).split()
         if len(token) > 2
     }
 
@@ -372,6 +530,44 @@ _CJK_CHAR_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 _LATIN_WORD_RE = re.compile(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*")
 _SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[\.\!\?。！？])\s+|\n+")
 _CLAUSE_BOUNDARY_RE = re.compile(r"(?<=[,;:，；：、])\s*")
+
+
+def _parse_relative_number(raw_value: str) -> int | None:
+    text = str(raw_value or "").strip().lower()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    if text in NUMBER_WORDS:
+        return NUMBER_WORDS[text]
+    if text in ZH_NUMBER_WORDS:
+        return ZH_NUMBER_WORDS[text]
+    if text == "十一":
+        return 11
+    if text == "十二":
+        return 12
+    if len(text) == 2 and text.startswith("十") and text[1] in ZH_NUMBER_WORDS:
+        return 10 + ZH_NUMBER_WORDS[text[1]]
+    if len(text) == 2 and text.endswith("十") and text[0] in ZH_NUMBER_WORDS:
+        return ZH_NUMBER_WORDS[text[0]] * 10
+    return None
+
+
+def _query_tokens_zh(query: str) -> set[str]:
+    tokens: set[str] = set()
+    for token in re.findall(r"[a-z0-9]+", query):
+        if len(token) > 1:
+            tokens.add(token)
+    for run in re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+", query):
+        clean = str(run).strip()
+        if len(clean) >= 2:
+            if len(clean) <= 8:
+                tokens.add(clean)
+            upper = min(4, len(clean))
+            for size in range(2, upper + 1):
+                for index in range(0, len(clean) - size + 1):
+                    tokens.add(clean[index : index + size])
+    return {token for token in tokens if token}
 
 
 def text_unit_count(text: str) -> int:

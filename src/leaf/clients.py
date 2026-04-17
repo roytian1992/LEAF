@@ -63,10 +63,7 @@ class ChatClient:
 
     def text(self, messages: list[dict[str, str]], **overrides: Any) -> str:
         response = self.chat(messages, **overrides)
-        try:
-            return response["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise OpenAICompatError(f"Unexpected chat response: {response}") from exc
+        return extract_chat_text(response)
 
 
 class EmbeddingClient:
@@ -99,6 +96,42 @@ def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
     if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
     return dot / (norm_a * norm_b)
+
+
+def estimate_text_tokens(text: str) -> int:
+    stripped = str(text or "")
+    if not stripped:
+        return 0
+    return max(1, math.ceil(len(stripped) / 4))
+
+
+def estimate_message_tokens(messages: list[dict[str, str]]) -> int:
+    total = 3
+    for message in messages:
+        total += 4
+        total += estimate_text_tokens(message.get("role", ""))
+        total += estimate_text_tokens(message.get("content", ""))
+    return total
+
+
+def extract_chat_text(response: dict[str, Any]) -> str:
+    try:
+        return response["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise OpenAICompatError(f"Unexpected chat response: {response}") from exc
+
+
+def extract_prompt_tokens(response: dict[str, Any]) -> int | None:
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get("prompt_tokens")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def extract_json_object(text: str) -> dict[str, Any]:

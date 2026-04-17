@@ -8,7 +8,15 @@ from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, defaultdict
 from typing import Any
 
-from .clients import ChatClient, EmbeddingClient, OpenAICompatError, extract_json_object
+from .clients import (
+    ChatClient,
+    EmbeddingClient,
+    OpenAICompatError,
+    estimate_message_tokens,
+    extract_chat_text,
+    extract_json_object,
+    extract_prompt_tokens,
+)
 from .extract import (
     AtomExtractor,
     build_text_tags,
@@ -244,7 +252,13 @@ class LEAFIndexer:
         snapshot_upserts_by_kind: dict[str, int] = defaultdict(int)
         input_text_chars = 0
         input_text_tokens_est = 0
-        self._ingest_runtime_metrics = {"reconcile_llm_calls": 0}
+        self._ingest_runtime_metrics = {
+            "reconcile_llm_calls": 0,
+            "reconcile_prompt_tokens_total": 0,
+            "reconcile_prompt_tokens_provider_usage_calls": 0,
+            "reconcile_prompt_tokens_estimated_calls": 0,
+        }
+        self.atom_extractor.reset_runtime_metrics()
         try:
             prepared_inputs: list[dict[str, Any]] = []
             for turn in turns:
@@ -312,7 +326,16 @@ class LEAFIndexer:
         finally:
             runtime_metrics = dict(getattr(self, "_ingest_runtime_metrics", {}) or {})
             self._ingest_runtime_metrics = None
+            atom_runtime_metrics = self.atom_extractor.consume_runtime_metrics()
         after_stats = self.store.get_corpus_stats(corpus_id)
+        atom_prompt_tokens_total = int(atom_runtime_metrics.get("atom_prompt_tokens_total", 0))
+        reconcile_prompt_tokens_total = int(runtime_metrics.get("reconcile_prompt_tokens_total", 0))
+        provider_usage_calls = int(atom_runtime_metrics.get("atom_prompt_tokens_provider_usage_calls", 0)) + int(
+            runtime_metrics.get("reconcile_prompt_tokens_provider_usage_calls", 0)
+        )
+        estimated_calls = int(atom_runtime_metrics.get("atom_prompt_tokens_estimated_calls", 0)) + int(
+            runtime_metrics.get("reconcile_prompt_tokens_estimated_calls", 0)
+        )
         return {
             "ingest_elapsed_ms": round((time.perf_counter() - started_at) * 1000.0, 2),
             "turn_count": len(turns),
@@ -325,13 +348,22 @@ class LEAFIndexer:
             "evidence_links_written": evidence_links_written,
             "state_candidates": state_candidates,
             "state_action_counts": dict(sorted(state_action_counts.items())),
-                "memory_llm_calls_est": {
+            "memory_llm_calls_est": {
                 "atom_extraction": extraction_chunk_count if self.atom_extractor.llm is not None else 0,
                 "reconciliation": int(runtime_metrics.get("reconcile_llm_calls", 0)),
                 "total": (
                     (extraction_chunk_count if self.atom_extractor.llm is not None else 0)
                     + int(runtime_metrics.get("reconcile_llm_calls", 0))
                 ),
+            },
+            "memory_llm_prompt_tokens_est": {
+                "atom_extraction": atom_prompt_tokens_total,
+                "reconciliation": reconcile_prompt_tokens_total,
+                "total": atom_prompt_tokens_total + reconcile_prompt_tokens_total,
+            },
+            "memory_llm_prompt_token_source": {
+                "provider_usage_calls": provider_usage_calls,
+                "estimated_calls": estimated_calls,
             },
             "extraction_chunk_count": extraction_chunk_count,
             "snapshot_upserts_by_kind": dict(sorted(snapshot_upserts_by_kind.items())),
@@ -2279,16 +2311,36 @@ class LEAFIndexer:
                 ),
             },
         ]
+        prompt_tokens = estimate_message_tokens(messages)
         try:
-            payload = extract_json_object(
-                self.reconciliation_llm.text(messages, max_tokens=120, temperature=0.0)
-            )
+            response = self.reconciliation_llm.chat(messages, max_tokens=120, temperature=0.0)
+            provider_prompt_tokens = extract_prompt_tokens(response)
+            if provider_prompt_tokens is not None:
+                prompt_tokens = provider_prompt_tokens
+            payload = extract_json_object(extract_chat_text(response))
         except (OpenAICompatError, ValueError):
             return None
+        self._record_reconcile_prompt_tokens(
+            prompt_tokens=prompt_tokens,
+            from_provider_usage=provider_prompt_tokens is not None,
+        )
         action = str(payload.get("action") or "").strip().upper()
         if action in {"NONE", "PATCH", "SUPERSEDE", "TENTATIVE"}:
             return action
         return None
+
+    def _record_reconcile_prompt_tokens(self, *, prompt_tokens: int, from_provider_usage: bool) -> None:
+        if not isinstance(getattr(self, "_ingest_runtime_metrics", None), dict):
+            return
+        self._ingest_runtime_metrics["reconcile_prompt_tokens_total"] = int(
+            self._ingest_runtime_metrics.get("reconcile_prompt_tokens_total", 0)
+        ) + int(prompt_tokens)
+        key = (
+            "reconcile_prompt_tokens_provider_usage_calls"
+            if from_provider_usage
+            else "reconcile_prompt_tokens_estimated_calls"
+        )
+        self._ingest_runtime_metrics[key] = int(self._ingest_runtime_metrics.get(key, 0)) + 1
 
     def _embed_text(self, text: str) -> list[float] | None:
         if self.embedding_client is None:

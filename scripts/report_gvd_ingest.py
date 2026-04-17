@@ -81,6 +81,7 @@ def maybe_ingest_persona(
     turns: list[dict[str, Any]],
     *,
     refresh: bool,
+    ingest_mode: str | None = None,
 ) -> dict[str, Any]:
     existing = set(service.list_corpora())
     if corpus_id in existing and not refresh:
@@ -90,7 +91,7 @@ def maybe_ingest_persona(
             f"Corpus {corpus_id} already exists in the SQLite store. "
             "Use a fresh DB path for refresh runs because LEAF does not yet support corpus deletion."
         )
-    result = service.append_turns(corpus_id=corpus_id, title=title, turns=turns)
+    result = service.append_turns(corpus_id=corpus_id, title=title, turns=turns, ingest_mode=ingest_mode)
     return {"ingested": True, "reused": False, "turn_count": len(turns), "result": result}
 
 
@@ -102,6 +103,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--personas", nargs="+", default=[])
     parser.add_argument("--persona-limit", type=int, default=0)
+    parser.add_argument("--ingest-mode", choices=["online", "migration"], default=None)
     parser.add_argument("--refresh", action="store_true")
     return parser.parse_args()
 
@@ -111,6 +113,8 @@ def main() -> None:
     service = LEAFService(config_path=args.config, db_path=args.db)
     started_at = time.perf_counter()
     try:
+        if not args.ingest_mode:
+            args.ingest_mode = str(service.config.ingest.mode)
         bank = load_memory_bank(args.memory_bank)
         persona_names = sorted(bank.keys(), key=lambda item: str(item).strip().lower())
         if args.personas:
@@ -131,6 +135,7 @@ def main() -> None:
                 title=f"GVD Persona {normalized_name}",
                 turns=turns,
                 refresh=args.refresh,
+                ingest_mode=args.ingest_mode,
             )
             ingest_rows.append(
                 {
@@ -149,6 +154,16 @@ def main() -> None:
             dict(row["ingest_metrics"])
             for row in ingest_rows
             if isinstance(row.get("ingest_metrics"), dict)
+        ]
+        ingest_llm_prompt_token_rows = [
+            dict(row.get("memory_llm_prompt_tokens_est") or {})
+            for row in ingest_metric_rows
+            if isinstance(row.get("memory_llm_prompt_tokens_est"), dict)
+        ]
+        ingest_llm_prompt_token_source_rows = [
+            dict(row.get("memory_llm_prompt_token_source") or {})
+            for row in ingest_metric_rows
+            if isinstance(row.get("memory_llm_prompt_token_source"), dict)
         ]
         ingest_elapsed_values = [float(row["ingest_elapsed_ms"]) for row in ingest_rows if row.get("ingest_elapsed_ms") is not None]
 
@@ -176,6 +191,8 @@ def main() -> None:
                     if isinstance(row.get("memory_llm_calls_est"), dict)
                 ]
             ),
+            "memory_llm_prompt_tokens_est_total": add_numeric_maps(ingest_llm_prompt_token_rows),
+            "memory_llm_prompt_token_source_total": add_numeric_maps(ingest_llm_prompt_token_source_rows),
             "state_action_counts_total": add_numeric_maps(
                 [
                     dict(row.get("state_action_counts") or {})
@@ -197,6 +214,7 @@ def main() -> None:
             "config": str(args.config),
             "memory_bank": str(args.memory_bank),
             "db": str(args.db),
+            "ingest_mode": str(args.ingest_mode),
             "personas": list(args.personas),
             "persona_limit": args.persona_limit,
             "refresh": args.refresh,

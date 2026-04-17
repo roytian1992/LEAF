@@ -94,3 +94,37 @@ Notes before launch:
 
 - this run uses the existing judged-answer supplementation script `scripts/judge_locomo_report.py`
 - it does not touch ingest, retrieval, answer prompt, or predicted answers; it only appends row-level judge fields and recomputes judge summaries
+
+## GVD dynamic-tree full100 preparation
+
+- method: `dynamic-tree`
+- objective: validate whether the current `dynamic-tree` LEAF path is broadly stronger than the canonical `LEAF(memory baseline)` on `GVD full100`
+- benchmark memory bank: `/vepfs-mlp2/c20250513/241404044/users/roytian/LEAF_dev/benchmarks/gvd/memory_bank_en.json`
+- benchmark questions: `/vepfs-mlp2/c20250513/241404044/users/roytian/LEAF_dev/benchmarks/gvd/probing_questions_en.jsonl`
+- config path: `/vepfs-mlp2/c20250513/241404044/users/roytian/LEAF/examples/config_local.yaml`
+- python: `/vepfs-mlp2/c20250513/241404044/users/roytian/anaconda3/bin/python`
+- tmux required: `yes`
+- planned ingest mode: `migration`
+- planned retrieval settings:
+  - `snapshot_limit = 6`
+  - `raw_span_limit = 8`
+- planned answer settings:
+  - `answer_style = short`
+  - `answer_revision = none`
+- planned DB: `/vepfs-mlp2/c20250513/241404044/users/roytian/LEAF_dev/data/gvd_leaf_dynamic_tree_full100_20260416.sqlite3`
+- planned main report: `/vepfs-mlp2/c20250513/241404044/users/roytian/LEAF_dev/reports/gvd_leaf_dynamic_tree_full100_20260416.json`
+- planned ingest report: `/vepfs-mlp2/c20250513/241404044/users/roytian/LEAF_dev/reports/gvd_leaf_dynamic_tree_full100_ingest_20260416.json`
+- planned gold eval: `/vepfs-mlp2/c20250513/241404044/users/roytian/LEAF_dev/reports/gvd_leaf_dynamic_tree_full100_gold_eval_20260416.json`
+- planned gold judge-1: `/vepfs-mlp2/c20250513/241404044/users/roytian/LEAF_dev/reports/gvd_leaf_dynamic_tree_full100_goldjudge1_20260416.json`
+
+Planned execution order:
+
+1. ingest-only report with `scripts/report_gvd_ingest.py --ingest-mode migration`
+2. main full100 QA report with `scripts/eval_gvd.py --ingest-mode migration --answer-style short --answer-revision none`
+3. gold eval against canonical GVD answer sheet
+4. gold-reference judge-1 on the completed report
+
+Notes before launch:
+
+- `eval_gvd.py` and `report_gvd_ingest.py` have been updated to accept `--ingest-mode {online,migration}`
+- this run has not been launched yet; we are waiting for the LoCoMo `judge-5` supplementation to finish before starting GVD

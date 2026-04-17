@@ -7,7 +7,8 @@ from typing import Any
 
 from .clients import ChatClient, EmbeddingClient
 from .config import load_config
-from .extract import AtomExtractor
+from .extract import AtomExtractor, set_language_mode as set_extract_language_mode
+from .grounding import set_language_mode as set_grounding_language_mode
 from .indexer import LEAFIndexer
 from .store import SQLiteMemoryStore
 from .search import retrieve_leaf_memory
@@ -16,6 +17,9 @@ from .search import retrieve_leaf_memory
 class LEAFService:
     def __init__(self, config_path: str | Path, db_path: str | Path):
         self.config = load_config(config_path)
+        language_mode = str((self.config.language.mode if self.config.language is not None else "en") or "en").strip().lower()
+        set_extract_language_mode(language_mode)
+        set_grounding_language_mode(language_mode)
         self.store = SQLiteMemoryStore(db_path)
         self._search_corpus_cache: dict[str, dict[str, Any]] = {}
         self.llm = ChatClient(self.config.llm) if self.config.llm.base_url else None

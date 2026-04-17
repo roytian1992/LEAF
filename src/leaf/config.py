@@ -27,11 +27,17 @@ class IngestConfig:
 
 
 @dataclass(slots=True)
+class LanguageConfig:
+    mode: str = "en"
+
+
+@dataclass(slots=True)
 class LEAFConfig:
     llm: ModelConfig
     embedding: ModelConfig
     additional_llm: ModelConfig | None = None
     ingest: IngestConfig | None = None
+    language: LanguageConfig | None = None
 
 
 def _load_model_config(section: dict) -> ModelConfig:
@@ -63,6 +69,14 @@ def _load_ingest_config(section: dict) -> IngestConfig:
     )
 
 
+def _load_language_config(section: dict) -> LanguageConfig:
+    payload = dict(section or {})
+    mode = str(payload.get("mode") or "en").strip().lower()
+    if mode not in {"en", "zh"}:
+        raise ValueError(f"Unsupported language.mode: {mode}")
+    return LanguageConfig(mode=mode)
+
+
 def load_config(path: str | Path) -> LEAFConfig:
     with open(path, "r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle) or {}
@@ -71,5 +85,5 @@ def load_config(path: str | Path) -> LEAFConfig:
         embedding=_load_model_config(payload.get("embedding") or {}),
         additional_llm=_load_model_config(payload.get("additional_llm") or {}) if (payload.get("additional_llm") or {}) else None,
         ingest=_load_ingest_config(payload.get("ingest") or {}),
+        language=_load_language_config(payload.get("language") or {}),
     )
-

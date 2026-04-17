@@ -10,3 +10,5 @@ data/
 reports/
 runs/
 .cache/
+tmp/
+examples/config_local.yaml

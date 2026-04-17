@@ -61,6 +61,8 @@ def main() -> None:
         snapshot_rows: list[dict[str, int]] = []
         state_action_rows: list[dict[str, int]] = []
         llm_call_rows: list[dict[str, int]] = []
+        llm_prompt_token_rows: list[dict[str, int]] = []
+        llm_prompt_token_source_rows: list[dict[str, int]] = []
 
         for sample in samples:
             sample_id, turns = base.locomo_sample_to_turns(sample)
@@ -108,6 +110,8 @@ def main() -> None:
                 snapshot_rows.append(dict(metrics.get("snapshot_upserts_by_kind") or {}))
                 state_action_rows.append(dict(metrics.get("state_action_counts") or {}))
                 llm_call_rows.append(dict(metrics.get("memory_llm_calls_est") or {}))
+                llm_prompt_token_rows.append(dict(metrics.get("memory_llm_prompt_tokens_est") or {}))
+                llm_prompt_token_source_rows.append(dict(metrics.get("memory_llm_prompt_token_source") or {}))
             print(
                 f"[locomo-ingest] sample={sample_id} ingest_done reused={ingest_result['reused']} "
                 f"elapsed_ms={round(ingest_elapsed_ms, 2)}",
@@ -140,6 +144,8 @@ def main() -> None:
                 "ingest_snapshot_upserts_by_kind_total": add_numeric_maps(snapshot_rows),
                 "ingest_state_action_counts_total": add_numeric_maps(state_action_rows),
                 "ingest_memory_llm_calls_est_total": add_numeric_maps(llm_call_rows),
+                "ingest_memory_llm_prompt_tokens_est_total": add_numeric_maps(llm_prompt_token_rows),
+                "ingest_memory_llm_prompt_token_source_total": add_numeric_maps(llm_prompt_token_source_rows),
             },
             "ingest": ingest_rows,
         }

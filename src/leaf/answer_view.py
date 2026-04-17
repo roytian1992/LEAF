@@ -4,7 +4,7 @@ import re
 from typing import Any
 
 from .extract import extract_entities
-from .grounding import is_inference_query, is_temporal_query, query_tokens as make_query_tokens
+from .grounding import get_language_mode, is_inference_query, is_temporal_query, query_tokens as make_query_tokens
 
 ANSWER_VIEW_SECTION_LABELS = {
     "direct_evidence": "Direct Evidence",
@@ -18,6 +18,35 @@ ANSWER_VIEW_SECTION_LABELS = {
     "page_summaries": "Context",
     "insufficient": "Insufficient",
 }
+
+ANSWER_VIEW_SECTION_LABELS_ZH = {
+    "direct_evidence": "直接证据",
+    "raw_evidence": "直接证据",
+    "entity_facts": "事实",
+    "facts": "事实",
+    "temporal_clues": "时间线索",
+    "relation_paths": "关系线索",
+    "relations": "关系线索",
+    "page_context": "上下文",
+    "page_summaries": "上下文",
+    "insufficient": "证据不足",
+}
+
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+
+def _contains_cjk(text: str) -> bool:
+    return bool(_CJK_RE.search(str(text or "")))
+
+
+def _resolve_language_mode(question: str, language_mode: str | None = None) -> str:
+    if language_mode is not None:
+        normalized = str(language_mode or "en").strip().lower()
+        if normalized in {"en", "zh"}:
+            return normalized
+    if _contains_cjk(question):
+        return "zh"
+    return str(get_language_mode() or "en").strip().lower()
 
 
 def _trim_text(text: str, max_chars: int) -> str:
@@ -51,15 +80,19 @@ def _score_answer_line(
     temporal: bool,
     inference: bool,
     section: str,
+    language_mode: str | None = None,
 ) -> float:
     lowered = str(line or "").lower()
     line_tokens = make_query_tokens(str(line or ""))
     score = len(query_token_set.intersection(line_tokens)) * 1.5
+    resolved_language = _resolve_language_mode(question, language_mode)
     for query_entity in query_entities:
         if query_entity and query_entity in lowered:
             score += 2.5
     if temporal:
         if re.search(r"\b(19|20)\d{2}\b", lowered):
+            score += 2.0
+        if re.search(r"(19|20)\d{2}年|\d{1,2}月\d{1,2}[日号]?", str(line or "")):
             score += 2.0
         if any(
             month in lowered
@@ -81,6 +114,11 @@ def _score_answer_line(
             score += 1.5
         if "[" in lowered and "]" in lowered:
             score += 1.0
+        if resolved_language == "zh" and any(
+            token in str(line or "")
+            for token in ["今天", "昨天", "前天", "那天", "当时", "上周", "本周", "这周", "下周", "上周末"]
+        ):
+            score += 1.0
     if inference:
         if section == "facts":
             score += 1.5
@@ -98,6 +136,14 @@ def _score_answer_line(
                 "education",
                 "study",
                 "wants to",
+                "性格",
+                "目标",
+                "计划",
+                "支持",
+                "职业",
+                "学习",
+                "喜欢",
+                "想要",
             ]
         ):
             score += 1.0
@@ -113,6 +159,7 @@ def _select_answer_lines(
     section: str,
     limit: int,
     max_chars: int,
+    language_mode: str | None = None,
 ) -> list[str]:
     query_entities = extract_entities(question)
     query_token_set = make_query_tokens(question)
@@ -131,6 +178,7 @@ def _select_answer_lines(
             temporal=temporal,
             inference=inference,
             section=section,
+            language_mode=language_mode,
         )
         scored.append((score, index, compact))
     scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
@@ -157,7 +205,7 @@ def _split_text_sentences(text: str) -> list[str]:
     compact = " ".join(str(text or "").split())
     if not compact:
         return []
-    parts = re.split(r"(?<=[.!?;])\s+|\s+\|\s+", compact)
+    parts = re.split(r"(?<=[.!?;。！？；])\s*|\s+\|\s+", compact)
     sentences = [part.strip() for part in parts if part and part.strip()]
     return sentences or [compact]
 
@@ -169,6 +217,7 @@ def _extract_relevant_text(
     section: str,
     max_chars: int,
     preserve_prefix: str = "",
+    language_mode: str | None = None,
 ) -> str:
     compact = " ".join(str(text or "").split())
     if not compact:
@@ -194,6 +243,7 @@ def _extract_relevant_text(
             temporal=temporal,
             inference=inference,
             section=section,
+            language_mode=language_mode,
         )
         scored.append((score, index, candidate))
     scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
@@ -223,6 +273,7 @@ def _score_view_items(
     section: str,
     limit: int,
     max_chars: int,
+    language_mode: str | None = None,
 ) -> list[dict[str, Any]]:
     query_entities = extract_entities(question)
     query_token_set = make_query_tokens(question)
@@ -241,6 +292,7 @@ def _score_view_items(
             temporal=temporal,
             inference=inference,
             section=section,
+            language_mode=language_mode,
         )
         citations = [str(value).strip() for value in item.get("citations") or [] if str(value).strip()]
         if citations:
@@ -250,7 +302,7 @@ def _score_view_items(
     return _dedupe_view_items([item for _, _, item in scored], limit=limit, max_chars=max_chars)
 
 
-def build_extractive_answer_view(question: str, evidence: dict[str, Any]) -> dict[str, Any]:
+def build_extractive_answer_view(question: str, evidence: dict[str, Any], *, language_mode: str | None = None) -> dict[str, Any]:
     pages = evidence.get("pages") or []
     atoms = evidence.get("atoms") or []
     raw_spans = evidence.get("raw_spans") or []
@@ -275,6 +327,7 @@ def build_extractive_answer_view(question: str, evidence: dict[str, Any]) -> dic
             section="raw_evidence",
             max_chars=170,
             preserve_prefix=prefix,
+            language_mode=language_mode,
         )
         item = {"text": text, "citations": [span_id] if span_id else []}
         direct_candidates.append(item)
@@ -290,6 +343,7 @@ def build_extractive_answer_view(question: str, evidence: dict[str, Any]) -> dic
                 str(atom.get("content") or ""),
                 section="facts",
                 max_chars=150,
+                language_mode=language_mode,
             ),
             "citations": ([atom_id] if atom_id else []) + support_ids[:2],
         }
@@ -302,6 +356,7 @@ def build_extractive_answer_view(question: str, evidence: dict[str, Any]) -> dic
                         f"{atom.get('content')} | time={atom.get('time_range')}",
                         section="raw_evidence",
                         max_chars=150,
+                        language_mode=language_mode,
                     ),
                     "citations": ([atom_id] if atom_id else []) + support_ids[:2],
                 }
@@ -329,6 +384,7 @@ def build_extractive_answer_view(question: str, evidence: dict[str, Any]) -> dic
                     f"{page.get('title')}: {summary}",
                     section="page_summaries",
                     max_chars=180,
+                    language_mode=language_mode,
                 ),
                 "citations": citations,
             }
@@ -341,6 +397,7 @@ def build_extractive_answer_view(question: str, evidence: dict[str, Any]) -> dic
                         f"{page.get('title')}: {summary} | time={page.get('time_range')}",
                         section="raw_evidence",
                         max_chars=150,
+                        language_mode=language_mode,
                     ),
                     "citations": citations,
                 }
@@ -355,6 +412,7 @@ def build_extractive_answer_view(question: str, evidence: dict[str, Any]) -> dic
             section="raw_evidence",
             limit=5 if temporal else 4,
             max_chars=200,
+            language_mode=language_mode,
         ),
         "entity_facts": _score_view_items(
             question,
@@ -362,6 +420,7 @@ def build_extractive_answer_view(question: str, evidence: dict[str, Any]) -> dic
             section="facts",
             limit=6 if inference else 5,
             max_chars=170,
+            language_mode=language_mode,
         ),
         "temporal_clues": _score_view_items(
             question,
@@ -369,6 +428,7 @@ def build_extractive_answer_view(question: str, evidence: dict[str, Any]) -> dic
             section="raw_evidence",
             limit=5 if temporal else 2,
             max_chars=170,
+            language_mode=language_mode,
         ),
         "relation_paths": _score_view_items(
             question,
@@ -376,6 +436,7 @@ def build_extractive_answer_view(question: str, evidence: dict[str, Any]) -> dic
             section="relations",
             limit=4,
             max_chars=140,
+            language_mode=language_mode,
         ),
         "page_context": _score_view_items(
             question,
@@ -383,6 +444,7 @@ def build_extractive_answer_view(question: str, evidence: dict[str, Any]) -> dic
             section="page_summaries",
             limit=3 if inference else 2,
             max_chars=180,
+            language_mode=language_mode,
         ),
         "insufficient": [],
     }
@@ -394,7 +456,7 @@ def build_extractive_answer_view(question: str, evidence: dict[str, Any]) -> dic
     return view
 
 
-def build_answer_view(question: str, evidence: dict[str, Any]) -> dict[str, Any]:
+def build_answer_view(question: str, evidence: dict[str, Any], *, language_mode: str | None = None) -> dict[str, Any]:
     pages = evidence.get("pages") or []
     atoms = evidence.get("atoms") or []
     raw_spans = evidence.get("raw_spans") or []
@@ -435,6 +497,7 @@ def build_answer_view(question: str, evidence: dict[str, Any]) -> dict[str, Any]
         section="page_summaries",
         limit=4 if inference else 3,
         max_chars=180,
+        language_mode=language_mode,
     )
     fact_lines = _select_answer_lines(
         question,
@@ -442,6 +505,7 @@ def build_answer_view(question: str, evidence: dict[str, Any]) -> dict[str, Any]
         section="facts",
         limit=8 if inference else 6,
         max_chars=160,
+        language_mode=language_mode,
     )
     raw_lines = _select_answer_lines(
         question,
@@ -449,6 +513,7 @@ def build_answer_view(question: str, evidence: dict[str, Any]) -> dict[str, Any]
         section="raw_evidence",
         limit=8 if temporal else 6,
         max_chars=200,
+        language_mode=language_mode,
     )
     relation_lines = _select_answer_lines(
         question,
@@ -456,6 +521,7 @@ def build_answer_view(question: str, evidence: dict[str, Any]) -> dict[str, Any]
         section="relations",
         limit=4,
         max_chars=130,
+        language_mode=language_mode,
     )
     return {
         "page_summaries": page_lines,
@@ -470,15 +536,18 @@ def build_compact_answer_view(
     evidence: dict[str, Any],
     *,
     mode: str = "extractive",
+    language_mode: str | None = None,
 ) -> dict[str, Any]:
     if mode == "heuristic":
-        return build_answer_view(question, evidence)
+        return build_answer_view(question, evidence, language_mode=language_mode)
     if mode == "extractive":
-        return build_extractive_answer_view(question, evidence)
+        return build_extractive_answer_view(question, evidence, language_mode=language_mode)
     raise ValueError(f"Unsupported answer view mode: {mode}")
 
 
-def render_answer_view_text(question: str, answer_view: dict[str, Any]) -> str:
+def render_answer_view_text(question: str, answer_view: dict[str, Any], *, language_mode: str | None = None) -> str:
+    resolved_language = _resolve_language_mode(question, language_mode)
+    section_labels = ANSWER_VIEW_SECTION_LABELS_ZH if resolved_language == "zh" else ANSWER_VIEW_SECTION_LABELS
     preferred_order = [
         "direct_evidence",
         "raw_evidence",
@@ -491,7 +560,7 @@ def render_answer_view_text(question: str, answer_view: dict[str, Any]) -> str:
         "page_summaries",
         "insufficient",
     ]
-    lines = [f"Question: {question}", "", "Evidence:"]
+    lines = [f"问题：{question}", "", "证据："] if resolved_language == "zh" else [f"Question: {question}", "", "Evidence:"]
     rendered_any = False
     for key in preferred_order:
         items = answer_view.get(key) or []
@@ -510,12 +579,16 @@ def render_answer_view_text(question: str, answer_view: dict[str, Any]) -> str:
         if not texts:
             continue
         rendered_any = True
-        lines.append(f"[{ANSWER_VIEW_SECTION_LABELS.get(key, key.replace('_', ' ').title())}]")
+        lines.append(f"[{section_labels.get(key, key.replace('_', ' ').title())}]")
         lines.extend(f"- {text}" for text in texts)
         lines.append("")
     if not rendered_any:
-        lines.append("[Evidence]")
-        lines.append("- No relevant evidence.")
+        if resolved_language == "zh":
+            lines.append("[证据]")
+            lines.append("- 没有检索到相关证据。")
+        else:
+            lines.append("[Evidence]")
+            lines.append("- No relevant evidence.")
     return "\n".join(lines).strip()
 
 
