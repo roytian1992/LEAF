@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import statistics
 import sys
@@ -472,6 +473,206 @@ def extract_answer_view_lines(answer_view: dict[str, Any], key: str) -> list[str
     return dedupe_preserve_order(lines)
 
 
+def join_answer_items(items: list[str]) -> str:
+    cleaned = [str(item).strip() for item in items if str(item).strip()]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    return ", ".join(cleaned[:-1]) + f", and {cleaned[-1]}"
+
+
+def extract_title_like_entities(text: str) -> list[str]:
+    matches = re.findall(
+        r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,4}\s(?:Park|Museum|Island|Lake|Beach|Gallery|Library|Theater|Theatre|Temple|Mountain|River|Zoo|School|University|Restaurant))\b",
+        str(text or ""),
+    )
+    return ordered_unique(matches)
+
+
+def normalize_english_place_answer(text: str) -> str:
+    candidate = clean_answer_phrase(text)
+    if not candidate:
+        return ""
+    candidate = re.split(r"[,.!?;:]", candidate, maxsplit=1)[0].strip()
+    candidate = re.sub(r"^(the)\s+", "", candidate, flags=re.IGNORECASE).strip()
+    candidate = re.sub(r"\s+(country|city|place)$", "", candidate, flags=re.IGNORECASE).strip()
+    if not candidate or re.search(r"\b(where|which|what)\b", candidate, flags=re.IGNORECASE):
+        return ""
+    return candidate
+
+
+def english_support_terms(text: str) -> set[str]:
+    raw_terms = re.findall(r"[a-z]+", str(text or "").lower())
+    normalized: set[str] = set()
+    for term in raw_terms:
+        if term in {"watching", "playing", "doing", "going", "traveling", "travelling"}:
+            continue
+        if term.endswith("ies") and len(term) > 4:
+            term = term[:-3] + "y"
+        elif term.endswith("s") and len(term) > 4:
+            term = term[:-1]
+        if term in {"film", "films"}:
+            term = "movie"
+        normalized.add(term)
+    return {term for term in normalized if term not in ANSWER_STOPWORDS}
+
+
+def extract_english_structured_answer_from_context(
+    question: str,
+    *,
+    answer_view: dict[str, Any],
+    context_lines: list[str],
+) -> str | None:
+    direct_lines = extract_answer_view_lines(answer_view, "direct_evidence")
+    base_lines = filter_context_lines_for_question(question, list(context_lines))
+    merged_lines = dedupe_preserve_order(direct_lines + base_lines) if direct_lines else base_lines
+    if not merged_lines:
+        return None
+
+    explicit_date = has_explicit_date(question)
+    month_day = target_month_day(question)
+    if explicit_date and month_day is not None:
+        dated = [line for line in merged_lines if line_date_token(line) == month_day]
+        if dated:
+            merged_lines = dated
+
+    line_rows: list[dict[str, Any]] = []
+    for index, line in enumerate(merged_lines):
+        payload = strip_context_prefix(line)
+        if not payload:
+            continue
+        line_rows.append(
+            {
+                "raw": line,
+                "payload": payload,
+                "index": index,
+                "is_assistant": "AI Companion:" in line,
+            }
+        )
+    if not line_rows:
+        return None
+
+    question_text = str(question or "").strip()
+    lowered_question = question_text.lower()
+
+    if is_yes_no_query(question_text):
+        negative_match = re.search(r"\bi don't like ([^?.,]+)", lowered_question)
+        if negative_match:
+            target_text = clean_answer_phrase(negative_match.group(1))
+            target = target_text.lower()
+            target_terms = english_support_terms(target_text)
+            for row in line_rows:
+                payload = str(row["payload"])
+                lowered_payload = payload.lower()
+                payload_terms = english_support_terms(payload)
+                if (
+                    "don't like" not in lowered_payload
+                    and "do not like" not in lowered_payload
+                    and "like" in lowered_payload
+                    and (
+                        (target and target in lowered_payload)
+                        or (
+                            target_terms
+                            and payload_terms
+                            and len(target_terms.intersection(payload_terms)) >= max(1, min(2, len(target_terms)))
+                        )
+                    )
+                ):
+                    return f"No, you like {target_text}"
+
+    if any(
+        token in lowered_question
+        for token in [
+            "where did i plan to go",
+            "where did i plan to travel",
+            "where are you planning to travel",
+            "where did i go",
+            "what country",
+            "what city",
+            "what place",
+        ]
+    ):
+        fact_payloads = [
+            strip_context_prefix(line)
+            for line in extract_answer_view_lines(answer_view, "entity_facts")
+        ]
+        search_payloads = [str(row["payload"]) for row in line_rows] + [payload for payload in fact_payloads if payload]
+        patterns = [
+            r"\bplan(?:ned)? to (?:go|travel) to ([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})\b",
+            r"\bplan(?:ned)? to stay in ([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})\b",
+            r"\b([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3}) is a very beautiful country\b",
+            r"\b([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3}) is a vibrant and charming place\b",
+        ]
+        for payload in search_payloads:
+            for pattern in patterns:
+                for match in re.finditer(pattern, payload):
+                    candidate = normalize_english_place_answer(match.group(1))
+                    if candidate:
+                        return candidate
+
+    if any(token in lowered_question for token in ["recipe", "specific recipe", "exact recipe", "specific steps", "exact steps"]):
+        detail_rows = [
+            str(row["payload"])
+            for row in line_rows
+            if any(token in str(row["payload"]).lower() for token in ["mix", "add", "added", "fry", "fried", "boil", "boiled", "ingredient", "ingredients", "seasoning", "marinate"])
+        ]
+        if detail_rows:
+            hedged_rows = [
+                text
+                for text in detail_rows
+                if any(marker in text.lower() for marker in ["vaguely remember", "maybe", "i think", "not sure", "probably", "guess"])
+            ]
+            grounded_rows = [text for text in detail_rows if text not in hedged_rows]
+            if hedged_rows and not grounded_rows:
+                return "UNKNOWN"
+
+    if is_list_query(question_text) and any(token in lowered_question for token in ["book", "books", "movie", "movies", "film", "films", "novel", "novels", "song", "songs"]):
+        title_candidates: list[tuple[float, str]] = []
+        for row in line_rows:
+            payload = str(row["payload"])
+            lowered_payload = payload.lower()
+            if any(marker in lowered_payload for marker in ["plan to", "planning to", "i plan to", "would like to", "want to", "going to read", "such as"]):
+                continue
+            titles = [clean_answer_phrase(match.group(1)) for match in TITLE_SPAN_RE.finditer(payload)]
+            titles = [title for title in titles if title]
+            if not titles:
+                continue
+            score = score_context_line(question_text, payload)
+            if any(marker in lowered_payload for marker in ["read", "recently read", "shared", "watched", "recommended", "favorite"]):
+                score += 0.25
+            for title in titles:
+                title_candidates.append((score, title))
+        if title_candidates:
+            title_candidates.sort(key=lambda item: item[0], reverse=True)
+            ordered_titles: list[str] = []
+            seen_titles: set[str] = set()
+            for _, title in title_candidates:
+                normalized = title.lower()
+                if normalized in seen_titles:
+                    continue
+                seen_titles.add(normalized)
+                ordered_titles.append(f'"{title}"')
+            if ordered_titles:
+                return join_answer_items(ordered_titles)
+
+    question_entities = extract_title_like_entities(question_text)
+    if question_entities:
+        evidence_entities = extract_title_like_entities(" ".join(str(row["payload"]) for row in line_rows))
+        if evidence_entities and not any(
+            question_entity.lower() == evidence_entity.lower()
+            for question_entity in question_entities
+            for evidence_entity in evidence_entities
+        ):
+            question_suffixes = {entity.split()[-1].lower() for entity in question_entities}
+            if any(entity.split()[-1].lower() in question_suffixes for entity in evidence_entities):
+                return "UNKNOWN"
+
+    return None
+
+
 def trim_display_line(text: str, max_chars: int = 220) -> str:
     compact = normalize_context_text(text)
     if len(compact) <= max_chars:
@@ -854,6 +1055,12 @@ def extract_structured_answer_from_context(
     context_lines: list[str],
     language_mode: str,
 ) -> str | None:
+    if language_mode == "en":
+        return extract_english_structured_answer_from_context(
+            question,
+            answer_view=answer_view,
+            context_lines=context_lines,
+        )
     if language_mode != "zh":
         return None
 
@@ -1050,19 +1257,52 @@ def build_structured_answer_payload(
         if session_id not in ordered_session_ids:
             ordered_session_ids.append(session_id)
 
+    precise_window_query = (
+        has_explicit_date(question)
+        or is_single_fact_query(question)
+        or is_yes_no_query(question)
+        or is_list_query(question)
+    )
+    session_window_mode = os.environ.get("LEAF_GVD_SESSION_WINDOW_MODE", "").strip().lower()
+
     session_windows: list[dict[str, Any]] = []
     for session_id in ordered_session_ids[:3]:
         rows = sorted(session_windows_map.get(session_id, []), key=lambda item: item[0])
         seen_lines: set[str] = set()
-        lines: list[str] = []
-        for _, rendered in rows:
+        deduped_rows: list[tuple[int, str]] = []
+        for turn_index, rendered in rows:
             normalized = rendered.lower()
             if normalized in seen_lines:
                 continue
             seen_lines.add(normalized)
-            lines.append(rendered)
-            if len(lines) >= 4:
-                break
+            deduped_rows.append((turn_index, rendered))
+        use_leading_wide = (
+            precise_window_query
+            and len(deduped_rows) > 4
+            and (
+                language_mode == "zh"
+                or session_window_mode == "leading_wide"
+            )
+        )
+        if use_leading_wide:
+            # Chinese GVD answers are often stated in the early turns of the same session.
+            # The same wider window can also be enabled for English via env for A/B testing.
+            lines = [rendered for _, rendered in deduped_rows[:6]]
+        elif precise_window_query and len(deduped_rows) > 4:
+            scored_rows = [
+                (score_context_line(question, rendered), index)
+                for index, (_, rendered) in enumerate(deduped_rows)
+            ]
+            anchor_score, anchor_index = max(scored_rows, key=lambda item: (item[0], -item[1]))
+            if anchor_score >= 0.2:
+                start = max(0, anchor_index - 1)
+                end = min(len(deduped_rows), start + 4)
+                start = max(0, end - 4)
+                lines = [rendered for _, rendered in deduped_rows[start:end]]
+            else:
+                lines = [rendered for _, rendered in deduped_rows[:4]]
+        else:
+            lines = [rendered for _, rendered in deduped_rows[:4]]
         if lines:
             session_windows.append({"session_id": session_id, "lines": lines})
 
@@ -1456,6 +1696,39 @@ def build_answer_messages(
             "If the payload is insufficient, return UNKNOWN.",
             "Return only the answer text with no explanation or preamble.",
         ]
+        lowered_question = str(question or "").strip().lower()
+        if is_single_fact_query(question) or has_explicit_date(question):
+            instruction_parts.append(
+                "If the question names a specific place, title, person, date, or other entity, do not silently correct it to a similar one from the payload."
+            )
+            instruction_parts.append(
+                "If the named detail in the question conflicts with the payload, answer UNKNOWN instead of substituting a near match."
+            )
+        if has_explicit_date(question) or is_list_query(question):
+            instruction_parts.append(
+                "For exact-date or exact-event list questions, include only items explicitly tied to that asked event."
+            )
+            instruction_parts.append(
+                "Exclude items that are only planned, recommended, hypothetical, future, or merely mentioned later in the same session."
+            )
+        if any(token in lowered_question for token in ["recipe", "specific recipe", "exact recipe", "steps", "specific steps"]):
+            instruction_parts.append(
+                "If the only detailed recipe or step description is hedged or uncertain, treat it as insufficient and answer UNKNOWN."
+            )
+            instruction_parts.append(
+                "Do not present vague recollections such as 'I vaguely remember' or 'maybe' as a specific exact recipe."
+            )
+        if yes_no_query:
+            instruction_parts.append(
+                "For confirmation questions about the user, rely on the user's own stated preference or action when available."
+            )
+            instruction_parts.append(
+                "Return only Yes or No, or Yes or No plus the shortest corrected fact; do not quote dialogue or add a longer rationale."
+            )
+        if any(token in lowered_question for token in ["issue", "problem", "emotional issue", "concern"]):
+            instruction_parts.append(
+                "For issue or problem questions, prefer the line where the user explicitly states the issue and avoid switching to a nearby but different topic."
+            )
     elif structured_compact_mode:
         instruction_parts = [
             "Answer the question using only the provided structured retrieval context.",

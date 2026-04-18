@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import http.client
 import json
 import math
 import socket
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -19,6 +21,10 @@ class OpenAICompatError(RuntimeError):
     pass
 
 
+def _retry_delay_seconds(attempt_index: int) -> float:
+    return min(4.0, 0.5 * (2 ** max(0, int(attempt_index))))
+
+
 def _post_json(url: str, payload: dict[str, Any], api_key: str, timeout: int) -> dict[str, Any]:
     request = urllib.request.Request(
         url=url,
@@ -29,16 +35,34 @@ def _post_json(url: str, payload: dict[str, Any], api_key: str, timeout: int) ->
         },
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return safe_json_loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise OpenAICompatError(f"HTTP {exc.code}: {body}") from exc
-    except urllib.error.URLError as exc:
-        raise OpenAICompatError(f"URL error: {exc}") from exc
-    except (TimeoutError, socket.timeout) as exc:
-        raise OpenAICompatError(f"Timeout error: {exc}") from exc
+    max_retries = 3
+    retryable_http_codes = {408, 409, 429, 500, 502, 503, 504}
+    for attempt in range(max_retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return safe_json_loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            if exc.code in retryable_http_codes and attempt < max_retries:
+                time.sleep(_retry_delay_seconds(attempt))
+                continue
+            raise OpenAICompatError(f"HTTP {exc.code}: {body}") from exc
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            socket.timeout,
+            http.client.RemoteDisconnected,
+            ConnectionResetError,
+        ) as exc:
+            if attempt < max_retries:
+                time.sleep(_retry_delay_seconds(attempt))
+                continue
+            if isinstance(exc, urllib.error.URLError):
+                raise OpenAICompatError(f"URL error: {exc}") from exc
+            if isinstance(exc, (TimeoutError, socket.timeout)):
+                raise OpenAICompatError(f"Timeout error: {exc}") from exc
+            raise OpenAICompatError(f"Connection error: {exc}") from exc
+    raise OpenAICompatError("Request failed after retries")
 
 
 class ChatClient:

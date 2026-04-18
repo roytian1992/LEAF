@@ -128,3 +128,59 @@ Notes before launch:
 
 - `eval_gvd.py` and `report_gvd_ingest.py` have been updated to accept `--ingest-mode {online,migration}`
 - this run has not been launched yet; we are waiting for the LoCoMo `judge-5` supplementation to finish before starting GVD
+
+## Ingest speed optimization note
+
+- recorded at: `2026-04-18 13:35:37 CST`
+- python env actually used for validation:
+  - `/vepfs-mlp2/c20250513/241404044/users/roytian/anaconda3/bin/python3`
+  - conda env: `base`
+- code paths changed:
+  - [service.py](/vepfs-mlp2/c20250513/241404044/users/roytian/LEAF/src/leaf/service.py)
+  - [indexer.py](/vepfs-mlp2/c20250513/241404044/users/roytian/LEAF/src/leaf/indexer.py)
+  - [store.py](/vepfs-mlp2/c20250513/241404044/users/roytian/LEAF/src/leaf/store.py)
+  - [extract.py](/vepfs-mlp2/c20250513/241404044/users/roytian/LEAF/src/leaf/extract.py)
+
+What changed:
+
+- `migration` ingest no longer refreshes session/entity/root snapshots twice.
+  - old path effectively did:
+    `append_turns(refresh snapshots) -> migrate_corpus(delete + rebuild snapshots)`
+  - new path does:
+    `append_turns(write events/atoms/objects only) -> migrate_corpus(build snapshots once)`
+- atom extraction now supports dedicated ingest-time concurrency via `LEAF_INGEST_EXTRACTION_WORKERS`.
+  - default falls back to the prepare-worker count.
+- derived snapshot refresh now uses batched version/event reads instead of repeated per-object point queries.
+- repeated `summarize_texts(...)` calls inside entity-slot snapshot building were deduplicated.
+
+Validation:
+
+- syntax check passed with:
+  - `/vepfs-mlp2/c20250513/241404044/users/roytian/anaconda3/bin/python3 -m py_compile ...`
+- smoke tests passed with:
+  - `/vepfs-mlp2/c20250513/241404044/users/roytian/anaconda3/bin/python3 -m unittest /vepfs-mlp2/c20250513/241404044/users/roytian/LEAF/tests/test_smoke.py`
+
+Micro-benchmark on `GVD Gary` (`58` turns):
+
+- old-equivalent path:
+  - `append_turns(refresh_snapshots=True) + migrate_corpus()`
+  - total: `27039.65 ms`
+- new migration path:
+  - `service.append_turns(..., ingest_mode="migration")`
+  - total: `25771.06 ms`
+- speedup from removing duplicate snapshot refresh alone:
+  - `1.049x`
+
+Atom-extraction concurrency benchmark on the same persona:
+
+- `LEAF_INGEST_EXTRACTION_WORKERS=1`
+  - total: `57803.15 ms`
+- `LEAF_INGEST_EXTRACTION_WORKERS=4`
+  - total: `20569.02 ms`
+- measured speedup:
+  - `2.81x`
+
+Current conclusion:
+
+- the dominant ingest bottleneck is atom extraction latency, not derived snapshot rebuilding.
+- removing duplicate snapshot refresh is still correct and worth keeping, but the qualitative speed gain mainly comes from extraction concurrency.
