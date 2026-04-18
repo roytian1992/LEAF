@@ -1014,6 +1014,137 @@ def extract_structured_answer_from_context(
     return None
 
 
+def build_structured_answer_payload(
+    question: str,
+    *,
+    evidence: dict[str, Any],
+    answer_view: dict[str, Any],
+    context_lines: list[str],
+    language_mode: str,
+) -> dict[str, Any]:
+    direct_lines = extract_answer_view_lines(answer_view, "direct_evidence")
+    fact_lines = extract_answer_view_lines(answer_view, "entity_facts")
+    temporal_lines = extract_answer_view_lines(answer_view, "temporal_clues")
+    relation_lines = extract_answer_view_lines(answer_view, "relation_paths")
+    page_lines = extract_answer_view_lines(answer_view, "page_context")
+
+    ordered_session_ids: list[str] = []
+    for line in direct_lines + temporal_lines + context_lines:
+        session_id = extract_session_id_from_context_line(line)
+        if session_id and session_id not in ordered_session_ids:
+            ordered_session_ids.append(session_id)
+
+    session_windows_map: dict[str, list[tuple[int, str]]] = {}
+    raw_spans = evidence.get("raw_spans") or []
+    for span in raw_spans:
+        session_id = str(span.get("session_id") or span.get("timestamp") or "").strip()
+        if not session_id:
+            continue
+        speaker = str(span.get("speaker") or "").strip()
+        text = normalize_context_text(span.get("text") or "")
+        if not text:
+            continue
+        rendered = f"{speaker}: {text}" if speaker else text
+        turn_index = int(span.get("turn_index") or 0)
+        session_windows_map.setdefault(session_id, []).append((turn_index, rendered))
+        if session_id not in ordered_session_ids:
+            ordered_session_ids.append(session_id)
+
+    session_windows: list[dict[str, Any]] = []
+    for session_id in ordered_session_ids[:3]:
+        rows = sorted(session_windows_map.get(session_id, []), key=lambda item: item[0])
+        seen_lines: set[str] = set()
+        lines: list[str] = []
+        for _, rendered in rows:
+            normalized = rendered.lower()
+            if normalized in seen_lines:
+                continue
+            seen_lines.add(normalized)
+            lines.append(rendered)
+            if len(lines) >= 4:
+                break
+        if lines:
+            session_windows.append({"session_id": session_id, "lines": lines})
+
+    return {
+        "question": question,
+        "language": language_mode,
+        "question_profile": {
+            "explicit_date": has_explicit_date(question),
+            "target_month_day": target_month_day(question),
+            "list": is_list_query(question),
+            "yes_no": is_yes_no_query(question),
+            "single_fact": is_single_fact_query(question),
+            "inference": is_inference_query(question),
+        },
+        "direct_evidence": direct_lines[:4],
+        "session_windows": session_windows,
+        "entity_facts": fact_lines[:4],
+        "temporal_clues": temporal_lines[:3],
+        "relation_paths": relation_lines[:3],
+        "page_context": page_lines[:3],
+    }
+
+
+def render_structured_answer_text(payload: dict[str, Any], *, language_mode: str) -> str:
+    is_zh = language_mode == "zh"
+    profile = dict(payload.get("question_profile") or {})
+    tags: list[str] = []
+    if profile.get("single_fact"):
+        tags.append("single_fact")
+    if profile.get("list"):
+        tags.append("list")
+    if profile.get("yes_no"):
+        tags.append("yes_no")
+    if profile.get("inference"):
+        tags.append("inference")
+    if profile.get("explicit_date"):
+        month_day = str(profile.get("target_month_day") or "").strip()
+        tags.append(f"date={month_day}" if month_day else "explicit_date")
+
+    section_specs: list[tuple[str, list[str]]] = []
+    if tags:
+        section_specs.append(("问题类型" if is_zh else "Question Profile", tags))
+    direct_lines = [str(item).strip() for item in (payload.get("direct_evidence") or []) if str(item).strip()]
+    if direct_lines:
+        section_specs.append(("直接证据" if is_zh else "Direct Evidence", direct_lines))
+
+    session_windows = payload.get("session_windows") or []
+    for row in session_windows:
+        if not isinstance(row, dict):
+            continue
+        session_id = str(row.get("session_id") or "").strip()
+        lines = [str(item).strip() for item in (row.get("lines") or []) if str(item).strip()]
+        if not lines:
+            continue
+        if is_zh:
+            label = f"会话窗口: {session_id}" if session_id else "会话窗口"
+        else:
+            label = f"Session Window: {session_id}" if session_id else "Session Window"
+        section_specs.append((label, lines))
+
+    fact_lines = [str(item).strip() for item in (payload.get("entity_facts") or []) if str(item).strip()]
+    if fact_lines:
+        section_specs.append(("补充事实" if is_zh else "Supporting Facts", fact_lines))
+    temporal_lines = [str(item).strip() for item in (payload.get("temporal_clues") or []) if str(item).strip()]
+    if temporal_lines:
+        section_specs.append(("时间线索" if is_zh else "Temporal Clues", temporal_lines))
+    relation_lines = [str(item).strip() for item in (payload.get("relation_paths") or []) if str(item).strip()]
+    if relation_lines:
+        section_specs.append(("关系线索" if is_zh else "Relation Paths", relation_lines))
+    page_lines = [str(item).strip() for item in (payload.get("page_context") or []) if str(item).strip()]
+    if page_lines:
+        section_specs.append(("页面上下文" if is_zh else "Page Context", page_lines))
+
+    lines: list[str] = []
+    for index, (label, items) in enumerate(section_specs):
+        if index:
+            lines.append("")
+        lines.append(f"[{label}]")
+        lines.extend(f"- {item}" for item in items)
+    return "\n".join(lines).strip()
+
+
 def prioritize_answer_context(question: str, context_lines: list[str]) -> tuple[list[str], float]:
     if not context_lines:
         return [], 0.0
@@ -1215,6 +1346,9 @@ def build_answer_messages(
     exact_short_mode = answer_style == "short" and (
         use_exact_short_mode(question) or (language_mode == "zh" and is_list_query(question))
     )
+    memoryos_aligned_mode = answer_style == "memoryos_aligned"
+    structured_context_mode = answer_style == "structured_context"
+    structured_compact_mode = answer_style == "structured_compact"
     single_fact_query = is_single_fact_query(question)
     explicit_date = has_explicit_date(question)
     yes_no_query = is_yes_no_query(question)
@@ -1260,6 +1394,34 @@ def build_answer_messages(
         if prioritized_lines:
             context_lines = prioritized_lines
         context = answer_view_text if answer_view_text is not None else "\n".join(context_lines).strip()
+    elif memoryos_aligned_mode:
+        top_support_score = 0.0
+        context = answer_view_text if answer_view_text is not None else "\n".join(context_lines).strip()
+    elif structured_context_mode:
+        top_support_score = 0.0
+        context = json.dumps(
+            build_structured_answer_payload(
+                question,
+                evidence=evidence,
+                answer_view=answer_view or {},
+                context_lines=context_lines,
+                language_mode=language_mode,
+            ),
+            ensure_ascii=False,
+            indent=2,
+        )
+    elif structured_compact_mode:
+        top_support_score = 0.0
+        context = render_structured_answer_text(
+            build_structured_answer_payload(
+                question,
+                evidence=evidence,
+                answer_view=answer_view or {},
+                context_lines=context_lines,
+                language_mode=language_mode,
+            ),
+            language_mode=language_mode,
+        )
     elif exact_short_mode:
         context, support_profile = select_short_answer_context(
             question,
@@ -1274,7 +1436,39 @@ def build_answer_messages(
     context = context.strip() or "(no retrieved evidence)"
     if language_mode == "zh":
         context = context.replace("[Direct Evidence]", "[直接证据]").replace("[Supporting Facts]", "[补充事实]")
-    if answer_style == "judge_aligned" and inference_mode:
+    if memoryos_aligned_mode:
+        instruction_parts = [
+            "Answer the question using only the provided MemoryOS retrieval context.",
+            "Prefer directly retrieved conversation pages.",
+            "Use user profile and long-term knowledge only as supporting context.",
+            "Return a short answer phrase, not a full explanation.",
+            "If the context is insufficient, return UNKNOWN.",
+        ]
+    elif structured_context_mode:
+        instruction_parts = [
+            "Answer the question using only the provided structured retrieval payload.",
+            "Treat direct_evidence as the strongest verbatim evidence.",
+            "Use session_windows to recover local conversation flow and resolve nearby references.",
+            "Use entity_facts, temporal_clues, relation_paths, and page_context only as supporting context.",
+            "Prefer direct grounded answers over vague summaries.",
+            "For list or support questions, combine all non-conflicting supported items from the payload.",
+            "For title, slot, or exact-value questions, return the shortest exact value supported by the payload.",
+            "If the payload is insufficient, return UNKNOWN.",
+            "Return only the answer text with no explanation or preamble.",
+        ]
+    elif structured_compact_mode:
+        instruction_parts = [
+            "Answer the question using only the provided structured retrieval context.",
+            "Direct Evidence contains the strongest verbatim evidence.",
+            "Session Window contains a short local conversation window from the same retrieved sessions.",
+            "Supporting Facts, Temporal Clues, Relation Paths, and Page Context are supporting signals only.",
+            "Prefer direct grounded answers over vague summaries.",
+            "For list or support questions, combine all non-conflicting supported items from the context.",
+            "For title, slot, or exact-value questions, return the shortest exact value supported by the context.",
+            "If the context is insufficient, return UNKNOWN.",
+            "Return only the answer text with no explanation or preamble.",
+        ]
+    elif answer_style == "judge_aligned" and inference_mode:
         instruction_parts = [
             "Answer the question using only the provided evidence.",
             "The evidence is organized into sectioned text lists such as Direct Evidence, Facts, Timeline, Relations, Context, and Insufficient.",
@@ -1388,9 +1582,13 @@ def build_answer_messages(
         {
             "role": "user",
             "content": (
-                f"Question: {question}\n\n"
-                f"Retrieved memory evidence:\n{context}\n\n"
-                "Return only the answer text."
+                context
+                if structured_context_mode
+                else (
+                    f"Question: {question}\n\n"
+                    f"Retrieved memory evidence:\n{context}\n\n"
+                    "Return only the answer text."
+                )
             ),
         },
     ]
@@ -1555,7 +1753,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--judge-with-llm", action="store_true")
     parser.add_argument(
         "--answer-style",
-        choices=["short", "judge_aligned"],
+        choices=["short", "judge_aligned", "memoryos_aligned", "structured_context", "structured_compact"],
         default="short",
         help="Controls only the answer synthesis layer; retrieval/memory remains unchanged.",
     )

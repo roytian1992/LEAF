@@ -23,10 +23,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--snapshot-limit", type=int, default=8)
     parser.add_argument("--raw-span-limit", type=int, default=8)
     parser.add_argument("--answer-view-mode", choices=["heuristic", "extractive"], default="heuristic")
+    parser.add_argument("--answer-style", choices=["short", "structured_context"], default="short")
+    parser.add_argument("--ingest-mode", default="reuse_only")
     parser.add_argument("--qa-workers", type=int, default=8)
     parser.add_argument("--ingest-prepare-workers", type=int, default=0)
     parser.add_argument("--judge-with-llm", action="store_true")
     parser.add_argument("--judge-runs", type=int, default=0)
+    parser.add_argument(
+        "--enable-heuristic-bypass",
+        action="store_true",
+        help="Opt in to the old behavior where a heuristic answer can bypass the answer prompt.",
+    )
+    parser.add_argument(
+        "--disable-heuristic-bypass",
+        action="store_true",
+        help="Deprecated no-op compatibility flag. Heuristic bypass is disabled by default.",
+    )
     return parser.parse_args()
 
 
@@ -137,10 +149,18 @@ def main() -> None:
         answer_view_text = ""
         answer_messages: list[dict[str, str]] = []
         answer_prompt_used = False
-        answer_prompt_mode = "heuristic" if heuristic_answer else "llm"
+        heuristic_bypass_triggered = bool(heuristic_answer)
+        heuristic_bypass_enabled = bool(args.enable_heuristic_bypass) and not bool(args.disable_heuristic_bypass)
+        heuristic_bypass_used = heuristic_bypass_triggered and heuristic_bypass_enabled
+        if heuristic_bypass_used:
+            answer_prompt_mode = "heuristic"
+        elif heuristic_bypass_triggered:
+            answer_prompt_mode = "llm_bypass_disabled"
+        else:
+            answer_prompt_mode = "llm"
         answer_prompt_input_tokens_est = 0
         answer_max_tokens = 0
-        if heuristic_answer:
+        if heuristic_bypass_used:
             predicted_answer = heuristic_answer
             answer_input_tokens_est = 0
         else:
@@ -155,6 +175,8 @@ def main() -> None:
                 evidence=evidence,
                 context_lines=context_lines,
                 answer_view_text=answer_view_text,
+                answer_view=answer_view,
+                answer_style=args.answer_style,
             )
             answer_prompt_input_tokens_est = base.estimate_message_tokens(answer_messages)
             answer_input_tokens_est = answer_prompt_input_tokens_est
@@ -195,6 +217,10 @@ def main() -> None:
             "answer_prompt_input_tokens_est": answer_prompt_input_tokens_est,
             "answer_prompt_used": answer_prompt_used,
             "answer_prompt_mode": answer_prompt_mode,
+            "answer_style": args.answer_style,
+            "heuristic_bypass_triggered": heuristic_bypass_triggered,
+            "heuristic_bypass_enabled": heuristic_bypass_enabled,
+            "heuristic_bypass_used": heuristic_bypass_used,
             "answer_max_tokens": answer_max_tokens,
             "heuristic_answer": heuristic_answer,
             "raw_span_count": len(evidence.get("raw_spans") or []),

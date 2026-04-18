@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, defaultdict
+from pathlib import Path
 from typing import Any
 
 from .clients import (
@@ -231,12 +234,15 @@ class LEAFIndexer:
         self.atom_extractor = atom_extractor
         self.embedding_client = embedding_client
         self.reconciliation_llm = reconciliation_llm
+        self._reconcile_cache_dir = self._resolve_reconcile_cache_dir()
 
     def append_turns(
         self,
         corpus_id: str,
         title: str,
         turns: list[dict[str, Any]],
+        *,
+        refresh_snapshots: bool = True,
     ) -> dict[str, Any]:
         started_at = time.perf_counter()
         before_stats = self.store.get_corpus_stats(corpus_id)
@@ -292,7 +298,8 @@ class LEAFIndexer:
                 )
             prepare_worker_count = self._ingest_prepare_worker_count()
             prepared_turns = self._prepare_turns_parallel(prepared_inputs, max_workers=prepare_worker_count)
-            prepared_turns = self._attach_chunk_extractions(prepared_turns)
+            extraction_worker_count = self._ingest_extraction_worker_count(default_workers=prepare_worker_count)
+            prepared_turns = self._attach_chunk_extractions(prepared_turns, max_workers=extraction_worker_count)
             extraction_chunk_count = sum(1 for prepared_turn in prepared_turns if prepared_turn.get("atoms"))
             for prepared_turn in prepared_turns:
                 event, atoms, touched_object_count, state_subjects, turn_metrics = self._apply_prepared_turn(
@@ -307,18 +314,19 @@ class LEAFIndexer:
                     state_action_counts[str(action)] += int(count)
                 touched_sessions.add(event.session_id)
                 touched_subjects.update(state_subjects)
-            for session_id in sorted(touched_sessions):
-                refresh_counts = self._refresh_session_snapshot(corpus_id=corpus_id, title=title, session_id=session_id)
-                for kind, count in refresh_counts.items():
-                    snapshot_upserts_by_kind[kind] += int(count)
-            for subject in sorted(touched_subjects):
-                refresh_counts = self._refresh_entity_snapshot(corpus_id=corpus_id, title=title, subject=subject)
-                for kind, count in refresh_counts.items():
-                    snapshot_upserts_by_kind[kind] += int(count)
-            if events_written > 0:
-                refresh_counts = self._refresh_root_snapshot(corpus_id=corpus_id, title=title)
-                for kind, count in refresh_counts.items():
-                    snapshot_upserts_by_kind[kind] += int(count)
+            if refresh_snapshots:
+                for session_id in sorted(touched_sessions):
+                    refresh_counts = self._refresh_session_snapshot(corpus_id=corpus_id, title=title, session_id=session_id)
+                    for kind, count in refresh_counts.items():
+                        snapshot_upserts_by_kind[kind] += int(count)
+                for subject in sorted(touched_subjects):
+                    refresh_counts = self._refresh_entity_snapshot(corpus_id=corpus_id, title=title, subject=subject)
+                    for kind, count in refresh_counts.items():
+                        snapshot_upserts_by_kind[kind] += int(count)
+                if events_written > 0:
+                    refresh_counts = self._refresh_root_snapshot(corpus_id=corpus_id, title=title)
+                    for kind, count in refresh_counts.items():
+                        snapshot_upserts_by_kind[kind] += int(count)
             self.store.commit()
         except Exception:
             self.store.rollback()
@@ -342,6 +350,8 @@ class LEAFIndexer:
             "input_text_chars": input_text_chars,
             "input_text_tokens_est": input_text_tokens_est,
             "prepare_workers": prepare_worker_count,
+            "extraction_workers": extraction_worker_count,
+            "snapshot_refresh_skipped": not refresh_snapshots,
             "events_written": events_written,
             "atoms_written": atoms_written,
             "objects_written": objects_written,
@@ -383,6 +393,15 @@ class LEAFIndexer:
             except ValueError:
                 return 4
         return 4
+
+    def _ingest_extraction_worker_count(self, *, default_workers: int) -> int:
+        raw_value = str(os.environ.get("LEAF_INGEST_EXTRACTION_WORKERS", "")).strip()
+        if raw_value:
+            try:
+                return max(1, int(raw_value))
+            except ValueError:
+                return max(1, default_workers)
+        return max(1, default_workers)
 
     def _prepare_turns_parallel(
         self,
@@ -454,7 +473,12 @@ class LEAFIndexer:
             "state_candidates": [],
         }
 
-    def _attach_chunk_extractions(self, prepared_turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _attach_chunk_extractions(
+        self,
+        prepared_turns: list[dict[str, Any]],
+        *,
+        max_workers: int,
+    ) -> list[dict[str, Any]]:
         if not prepared_turns:
             return prepared_turns
         grouped_by_session: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -466,6 +490,7 @@ class LEAFIndexer:
             grouped_by_session[session_id].append(prepared_turn)
             prepared_turn["atoms"] = []
             prepared_turn["state_candidates"] = []
+        chunk_jobs: list[dict[str, Any]] = []
         for session_id in session_order:
             session_turns = grouped_by_session[session_id]
             chunks = self._build_extraction_chunks(session_turns)
@@ -474,40 +499,67 @@ class LEAFIndexer:
                 anchor_turn = chunk[-1]
                 anchor_event = anchor_turn["event"]
                 extraction_span = self._build_chunk_extraction_span(chunk, previous_chunk)
-                extracted_atoms = self.atom_extractor.extract_atoms(extraction_span)
                 support_span_ids = [str(item["span"].span_id) for item in chunk if item.get("span") is not None]
-                anchor_span_id = str(anchor_turn["span"].span_id)
-                atoms = [
-                    MemoryAtomRecord(
-                        atom_id=atom.atom_id,
-                        event_id=anchor_event.event_id,
-                        corpus_id=atom.corpus_id,
-                        span_id=anchor_span_id,
-                        atom_type=atom.atom_type,
-                        content=atom.content,
-                        entities=atom.entities,
-                        canonical_entities=atom.canonical_entities,
-                        support_span_ids=support_span_ids,
-                        derived_from_atom_ids=atom.derived_from_atom_ids,
-                        memory_kind=atom.memory_kind,
-                        status=atom.status,
-                        time_range=atom.time_range,
-                        confidence=atom.confidence,
-                        metadata={
-                            **dict(atom.metadata or {}),
-                            "source_speaker": anchor_event.speaker,
-                            "merged_chunk_span_id": extraction_span.span_id,
-                            "merged_turn_count": len(chunk),
-                            "support_span_ids": support_span_ids,
-                            "merged_turn_indexes": [int(item["event"].turn_index) for item in chunk],
-                            "chunk_session_id": anchor_event.session_id,
-                        },
-                    )
-                    for atom in extracted_atoms
-                ]
-                anchor_turn["atoms"] = atoms
-                anchor_turn["state_candidates"] = self._derive_state_candidates(event=anchor_event, atoms=atoms)
+                chunk_jobs.append(
+                    {
+                        "anchor_turn": anchor_turn,
+                        "anchor_event": anchor_event,
+                        "extraction_span": extraction_span,
+                        "support_span_ids": support_span_ids,
+                        "merged_turn_indexes": [int(item["event"].turn_index) for item in chunk],
+                    }
+                )
                 previous_chunk = chunk
+        if not chunk_jobs:
+            return prepared_turns
+        extracted_atoms_by_job: list[list[Any] | None] = [None] * len(chunk_jobs)
+        if max_workers <= 1 or len(chunk_jobs) == 1:
+            for index, job in enumerate(chunk_jobs):
+                extracted_atoms_by_job[index] = self.atom_extractor.extract_atoms(job["extraction_span"])
+        else:
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(chunk_jobs))) as executor:
+                futures = [
+                    executor.submit(self.atom_extractor.extract_atoms, job["extraction_span"])
+                    for job in chunk_jobs
+                ]
+                for index, future in enumerate(futures):
+                    extracted_atoms_by_job[index] = future.result()
+        for job, extracted_atoms in zip(chunk_jobs, extracted_atoms_by_job):
+            anchor_turn = job["anchor_turn"]
+            anchor_event = job["anchor_event"]
+            extraction_span = job["extraction_span"]
+            support_span_ids = list(job["support_span_ids"])
+            anchor_span_id = str(anchor_turn["span"].span_id)
+            atoms = [
+                MemoryAtomRecord(
+                    atom_id=atom.atom_id,
+                    event_id=anchor_event.event_id,
+                    corpus_id=atom.corpus_id,
+                    span_id=anchor_span_id,
+                    atom_type=atom.atom_type,
+                    content=atom.content,
+                    entities=atom.entities,
+                    canonical_entities=atom.canonical_entities,
+                    support_span_ids=support_span_ids,
+                    derived_from_atom_ids=atom.derived_from_atom_ids,
+                    memory_kind=atom.memory_kind,
+                    status=atom.status,
+                    time_range=atom.time_range,
+                    confidence=atom.confidence,
+                    metadata={
+                        **dict(atom.metadata or {}),
+                        "source_speaker": anchor_event.speaker,
+                        "merged_chunk_span_id": extraction_span.span_id,
+                        "merged_turn_count": len(support_span_ids),
+                        "support_span_ids": support_span_ids,
+                        "merged_turn_indexes": list(job["merged_turn_indexes"]),
+                        "chunk_session_id": anchor_event.session_id,
+                    },
+                )
+                for atom in (extracted_atoms or [])
+            ]
+            anchor_turn["atoms"] = atoms
+            anchor_turn["state_candidates"] = self._derive_state_candidates(event=anchor_event, atoms=atoms)
         return prepared_turns
 
     def _apply_prepared_turn(
@@ -892,6 +944,7 @@ class LEAFIndexer:
     def _refresh_session_snapshot(self, corpus_id: str, title: str, session_id: str) -> dict[str, int]:
         events = self.store.get_events(corpus_id=corpus_id, session_id=session_id)
         objects = self.store.get_objects_for_session(corpus_id=corpus_id, session_id=session_id)
+        latest_versions_by_object = self.store.get_latest_versions([obj.object_id for obj in objects])
         session_snapshot_id = stable_id("leaf_snap", corpus_id, "session", session_id)
         self.store.delete_snapshots_by_scope_prefix(corpus_id=corpus_id, snapshot_kind="session_page", scope_prefix=f"{session_id}:page:")
         self.store.delete_snapshots_by_scope_prefix(corpus_id=corpus_id, snapshot_kind="session_block", scope_prefix=f"{session_id}:block:")
@@ -912,7 +965,7 @@ class LEAFIndexer:
         active_summaries: list[str] = []
         object_ids: list[str] = []
         for obj in objects:
-            version = self.store.get_latest_version(obj.object_id)
+            version = latest_versions_by_object.get(obj.object_id)
             if version is None:
                 continue
             object_ids.append(obj.object_id)
@@ -1145,14 +1198,15 @@ class LEAFIndexer:
         build_entity_facets: bool = ENABLE_ENTITY_FACET_SNAPSHOTS,
     ) -> dict[str, int]:
         objects = self.store.get_objects_for_subject(corpus_id=corpus_id, subject=subject)
+        object_ids = [obj.object_id for obj in objects]
+        versions_by_object = self.store.get_object_versions_for_objects(object_ids)
+        latest_versions_by_object = self.store.get_latest_versions(object_ids)
         self.store.delete_snapshots_by_scope_prefix(corpus_id=corpus_id, snapshot_kind="entity_slot", scope_prefix=f"{subject}:")
         self.store.delete_snapshots_by_scope_prefix(corpus_id=corpus_id, snapshot_kind="entity_aspect", scope_prefix=f"{subject}:")
         self.store.delete_snapshots_by_scope_prefix(corpus_id=corpus_id, snapshot_kind="entity_facet", scope_prefix=f"{subject}:")
         versions: list[MemoryObjectVersionRecord] = []
-        object_ids: list[str] = []
         for obj in objects:
-            object_ids.append(obj.object_id)
-            versions.extend(self.store.get_object_versions(obj.object_id))
+            versions.extend(versions_by_object.get(obj.object_id, []))
         active_versions = [version.summary for version in versions if version.status == "active"]
         recent_events = self.store.get_events_for_entity(corpus_id=corpus_id, entity=subject, limit=12)
         event_texts = [f"{event.speaker}: {event.text}" for event in recent_events]
@@ -1167,6 +1221,7 @@ class LEAFIndexer:
             subject=subject,
             objects=objects,
             parent_snapshot_id=entity_snapshot_id,
+            latest_versions_by_object=latest_versions_by_object,
         )
         aspect_snapshots: list[MemorySnapshotRecord] = []
         if build_entity_aspects:
@@ -1176,6 +1231,7 @@ class LEAFIndexer:
                 subject=subject,
                 objects=objects,
                 parent_snapshot_id=entity_snapshot_id,
+                latest_versions_by_object=latest_versions_by_object,
             )
         facet_snapshots: list[MemorySnapshotRecord] = []
         if build_entity_facets:
@@ -1185,6 +1241,7 @@ class LEAFIndexer:
                 subject=subject,
                 objects=objects,
                 parent_snapshot_id=entity_snapshot_id,
+                latest_versions_by_object=latest_versions_by_object,
             )
         snapshot = MemorySnapshotRecord(
             snapshot_id=entity_snapshot_id,
@@ -1232,6 +1289,7 @@ class LEAFIndexer:
         subject: str,
         objects: list[MemoryObjectRecord],
         parent_snapshot_id: str,
+        latest_versions_by_object: dict[str, MemoryObjectVersionRecord] | None = None,
     ) -> list[MemorySnapshotRecord]:
         slot_snapshots: list[MemorySnapshotRecord] = []
         objects_by_slot: dict[str, list[MemoryObjectRecord]] = defaultdict(list)
@@ -1245,7 +1303,7 @@ class LEAFIndexer:
             slot_object_ids: list[str] = []
             for obj in slot_objects:
                 slot_object_ids.append(obj.object_id)
-                latest_version = self.store.get_latest_version(obj.object_id)
+                latest_version = (latest_versions_by_object or {}).get(obj.object_id) or self.store.get_latest_version(obj.object_id)
                 if latest_version is not None and str(latest_version.status or "") == "active":
                     active_versions.append(latest_version)
             if not active_versions and not slot_object_ids:
@@ -1267,6 +1325,7 @@ class LEAFIndexer:
             summary_inputs = [subject, slot] + version_summaries + event_texts
             refs = merge_memory_refs(summary_inputs, limit=16)
             tags = build_text_tags(summary_inputs, max_tags=5)
+            slot_summary = summarize_texts(summary_inputs, max_chars=760)
             slot_snapshot = MemorySnapshotRecord(
                 snapshot_id=stable_id("leaf_snap", corpus_id, "entity_slot", subject, slot),
                 corpus_id=corpus_id,
@@ -1275,7 +1334,7 @@ class LEAFIndexer:
                 scope_id=f"{subject}:{slot}",
                 title=f"{title}:{subject}:{slot}",
                 synopsis=make_synopsis(version_summaries[:3] + event_texts[:3], max_chars=180),
-                summary=summarize_texts(summary_inputs, max_chars=760),
+                summary=slot_summary,
                 object_ids=slot_object_ids[:ENTITY_SLOT_OBJECT_LIMIT],
                 event_ids=[event.event_id for event in support_events[:ENTITY_SLOT_EVENT_LIMIT]],
                 raw_refs=[event.raw_span_id for event in support_events[:ENTITY_SLOT_EVENT_LIMIT] if event.raw_span_id],
@@ -1292,7 +1351,7 @@ class LEAFIndexer:
                     "num_events": len(support_events),
                     "tags": tags,
                 },
-                embedding=self._embed_snapshot(f"{title}:{subject}:{slot}", summarize_texts(summary_inputs, max_chars=760), tags),
+                embedding=self._embed_snapshot(f"{title}:{subject}:{slot}", slot_summary, tags),
             )
             self.store.upsert_snapshot(slot_snapshot)
             slot_snapshots.append(slot_snapshot)
@@ -1306,10 +1365,11 @@ class LEAFIndexer:
         subject: str,
         objects: list[MemoryObjectRecord],
         parent_snapshot_id: str,
+        latest_versions_by_object: dict[str, MemoryObjectVersionRecord] | None = None,
     ) -> list[MemorySnapshotRecord]:
         aspect_snapshots: list[MemorySnapshotRecord] = []
         for obj in objects:
-            latest_version = self.store.get_latest_version(obj.object_id)
+            latest_version = (latest_versions_by_object or {}).get(obj.object_id) or self.store.get_latest_version(obj.object_id)
             if latest_version is None or str(latest_version.status or "") != "active":
                 continue
             support_events = self.store.get_events_for_object_ids(
@@ -1384,11 +1444,12 @@ class LEAFIndexer:
         subject: str,
         objects: list[MemoryObjectRecord],
         parent_snapshot_id: str,
+        latest_versions_by_object: dict[str, MemoryObjectVersionRecord] | None = None,
     ) -> list[MemorySnapshotRecord]:
         subject_tokens = _token_set(subject)
         facet_groups: dict[str, dict[str, Any]] = {}
         for obj in objects:
-            latest_version = self.store.get_latest_version(obj.object_id)
+            latest_version = (latest_versions_by_object or {}).get(obj.object_id) or self.store.get_latest_version(obj.object_id)
             if latest_version is None or str(latest_version.status or "") != "active":
                 continue
             support_events = self.store.get_events_for_object_ids(
@@ -1461,18 +1522,22 @@ class LEAFIndexer:
             ),
         )
         snapshots: list[MemorySnapshotRecord] = []
+        event_map = self.store.get_events_by_ids(
+            [
+                event_id
+                for group in ranked_groups[:ENTITY_FACET_MAX_PER_SUBJECT]
+                for event_id in group["event_ids"][:ENTITY_FACET_EVENT_LIMIT]
+            ]
+        )
         for group in ranked_groups[:ENTITY_FACET_MAX_PER_SUBJECT]:
             anchor = str(group["anchor"]).strip()
             if not anchor:
                 continue
             facet_terms = _ordered_unique_strings(list(group["facet_terms"]))[:6]
             snapshot_events = [
-                event
-                for event in (
-                    self.store.get_event(event_id)
-                    for event_id in group["event_ids"][:ENTITY_FACET_EVENT_LIMIT]
-                )
-                if event is not None
+                event_map[event_id]
+                for event_id in group["event_ids"][:ENTITY_FACET_EVENT_LIMIT]
+                if event_id in event_map
             ]
             summary_inputs = [subject, anchor]
             summary_inputs.extend(group["version_summaries"][:6])
@@ -2285,6 +2350,14 @@ class LEAFIndexer:
     ) -> str | None:
         if self.reconciliation_llm is None:
             return None
+        cache_key = self._reconcile_cache_key(
+            candidate=candidate,
+            current=current,
+            current_version=current_version,
+        )
+        cached_action = self._load_cached_reconcile_action(cache_key=cache_key)
+        if cached_action is not None:
+            return cached_action
         if isinstance(getattr(self, "_ingest_runtime_metrics", None), dict):
             self._ingest_runtime_metrics["reconcile_llm_calls"] = int(
                 self._ingest_runtime_metrics.get("reconcile_llm_calls", 0)
@@ -2326,6 +2399,7 @@ class LEAFIndexer:
         )
         action = str(payload.get("action") or "").strip().upper()
         if action in {"NONE", "PATCH", "SUPERSEDE", "TENTATIVE"}:
+            self._store_cached_reconcile_action(cache_key=cache_key, action=action)
             return action
         return None
 
@@ -2341,6 +2415,83 @@ class LEAFIndexer:
             else "reconcile_prompt_tokens_estimated_calls"
         )
         self._ingest_runtime_metrics[key] = int(self._ingest_runtime_metrics.get(key, 0)) + 1
+
+    def _resolve_reconcile_cache_dir(self) -> Path | None:
+        if os.environ.get("LEAF_DISABLE_RECONCILE_CACHE", "").strip().lower() in {"1", "true", "yes"}:
+            return None
+        raw_dir = os.environ.get("LEAF_RECONCILE_CACHE_DIR", "").strip()
+        if not raw_dir:
+            raw_dir = os.path.expanduser("~/.cache/leaf/reconciliation")
+        try:
+            path = Path(raw_dir)
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except OSError:
+            return None
+
+    def _reconcile_cache_key(
+        self,
+        *,
+        candidate: StateCandidate,
+        current: MemoryObjectRecord,
+        current_version: MemoryObjectVersionRecord,
+    ) -> str:
+        model_name = str(getattr(getattr(self.reconciliation_llm, "config", None), "model_name", "") or "")
+        base_url = str(getattr(getattr(self.reconciliation_llm, "config", None), "base_url", "") or "")
+        prompt_revision = "reconcile_prompt_v1"
+        digest = hashlib.sha1(
+            "||".join(
+                [
+                    prompt_revision,
+                    model_name,
+                    base_url,
+                    str(current.subject or ""),
+                    str(current.slot or ""),
+                    str(current.policy or ""),
+                    str(current.memory_kind or ""),
+                    str(current_version.value or ""),
+                    str(current_version.status or ""),
+                    str(candidate.value or ""),
+                    str(candidate.status or ""),
+                    str(candidate.memory_kind or ""),
+                ]
+            ).encode("utf-8")
+        ).hexdigest()
+        return digest
+
+    def _reconcile_cache_file_path(self, cache_key: str) -> Path | None:
+        if self._reconcile_cache_dir is None:
+            return None
+        return self._reconcile_cache_dir / f"{cache_key}.json"
+
+    def _load_cached_reconcile_action(self, *, cache_key: str) -> str | None:
+        cache_path = self._reconcile_cache_file_path(cache_key)
+        if cache_path is None or not cache_path.exists():
+            return None
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return None
+        action = str((payload or {}).get("action") or "").strip().upper()
+        if action in {"NONE", "PATCH", "SUPERSEDE", "TENTATIVE"}:
+            return action
+        return None
+
+    def _store_cached_reconcile_action(self, *, cache_key: str, action: str) -> None:
+        cache_path = self._reconcile_cache_file_path(cache_key)
+        if cache_path is None:
+            return
+        payload = {"action": str(action).strip().upper()}
+        temp_path = cache_path.with_suffix(".tmp")
+        try:
+            temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            temp_path.replace(cache_path)
+        except OSError:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except OSError:
+                pass
 
     def _embed_text(self, text: str) -> list[float] | None:
         if self.embedding_client is None:

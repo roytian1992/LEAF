@@ -62,7 +62,12 @@ class LEAFService:
     ) -> dict[str, Any]:
         self._search_corpus_cache.pop(str(corpus_id), None)
         resolved_mode = self._resolve_ingest_mode(ingest_mode)
-        result = self.indexer.append_turns(corpus_id=corpus_id, title=title, turns=turns)
+        result = self.indexer.append_turns(
+            corpus_id=corpus_id,
+            title=title,
+            turns=turns,
+            refresh_snapshots=(resolved_mode != "migration"),
+        )
         if resolved_mode == "migration":
             migration = self.migrate_corpus(corpus_id=corpus_id, title=title)
             result = self._merge_ingest_and_migration_results(result, migration)

@@ -841,19 +841,121 @@ def build_answer_context_lines(evidence: dict[str, Any]) -> list[str]:
     return context_lines
 
 
+def extract_answer_view_lines(answer_view: dict[str, Any], key: str) -> list[str]:
+    items = answer_view.get(key) or []
+    if not isinstance(items, list):
+        items = [items]
+    lines: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = str(item.get("text") or "").strip() if isinstance(item, dict) else str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        lines.append(text)
+    return lines
+
+
+def extract_session_id_from_context_line(line: str) -> str | None:
+    text = str(line or "").strip()
+    match = re.match(r"^\[([^\]]+)\]\s*", text)
+    if not match:
+        return None
+    parts = [part.strip() for part in match.group(1).split("|") if part.strip()]
+    return parts[0] if parts else None
+
+
+def build_structured_answer_payload(
+    question: str,
+    *,
+    evidence: dict[str, Any],
+    answer_view: dict[str, Any],
+    context_lines: list[str],
+) -> dict[str, Any]:
+    direct_lines = extract_answer_view_lines(answer_view, "direct_evidence") or extract_answer_view_lines(answer_view, "raw_evidence")
+    fact_lines = extract_answer_view_lines(answer_view, "entity_facts") or extract_answer_view_lines(answer_view, "facts")
+    temporal_lines = extract_answer_view_lines(answer_view, "temporal_clues")
+    relation_lines = extract_answer_view_lines(answer_view, "relation_paths") or extract_answer_view_lines(answer_view, "relations")
+    page_lines = extract_answer_view_lines(answer_view, "page_context") or extract_answer_view_lines(answer_view, "page_summaries")
+
+    ordered_session_ids: list[str] = []
+    for line in direct_lines + temporal_lines + context_lines:
+        session_id = extract_session_id_from_context_line(line)
+        if session_id and session_id not in ordered_session_ids:
+            ordered_session_ids.append(session_id)
+
+    session_windows_map: dict[str, list[tuple[int, str]]] = {}
+    for span in evidence.get("raw_spans") or []:
+        session_id = str(span.get("session_id") or span.get("timestamp") or "").strip()
+        if not session_id:
+            continue
+        speaker = str(span.get("speaker") or "").strip()
+        text = str(span.get("text") or "").strip()
+        if not text:
+            continue
+        rendered = f"{speaker}: {text}" if speaker else text
+        turn_index = int(span.get("turn_index") or 0)
+        session_windows_map.setdefault(session_id, []).append((turn_index, rendered))
+        if session_id not in ordered_session_ids:
+            ordered_session_ids.append(session_id)
+
+    session_windows: list[dict[str, Any]] = []
+    for session_id in ordered_session_ids[:3]:
+        rows = sorted(session_windows_map.get(session_id, []), key=lambda item: item[0])
+        seen_lines: set[str] = set()
+        lines: list[str] = []
+        for _, rendered in rows:
+            if rendered in seen_lines:
+                continue
+            seen_lines.add(rendered)
+            lines.append(rendered)
+            if len(lines) >= 4:
+                break
+        if lines:
+            session_windows.append({"session_id": session_id, "lines": lines})
+
+    return {
+        "question": question,
+        "question_profile": {
+            "explicit_date": has_explicit_date(question),
+            "target_month_day": target_month_day(question),
+            "list": is_list_query(question),
+            "yes_no": is_yes_no_query(question),
+            "single_fact": is_single_fact_query(question),
+            "inference": is_inference_query(question),
+        },
+        "direct_evidence": direct_lines[:4],
+        "session_windows": session_windows,
+        "entity_facts": fact_lines[:4],
+        "temporal_clues": temporal_lines[:3],
+        "relation_paths": relation_lines[:3],
+        "page_context": page_lines[:3],
+    }
+
+
 def build_answer_messages(
     question: str,
     evidence: dict[str, Any],
     *,
     context_lines: list[str] | None = None,
     answer_view_text: str | None = None,
+    answer_view: dict[str, Any] | None = None,
+    answer_style: str = "short",
 ) -> list[dict[str, str]]:
     context_lines = context_lines if context_lines is not None else build_answer_context_lines(evidence)
     inference_mode = is_inference_query(question)
+    structured_context_mode = answer_style == "structured_context"
     system_prompt = (
         "You are an intelligent memory assistant tasked with answering questions from conversation memories. "
-        "Use only the provided evidence. Carefully analyze the evidence, pay attention to timestamps, and prefer direct evidence when available. "
-        "If multiple memories conflict, prioritize the most recent well-supported memory. "
+        + (
+            "Use only the provided structured retrieval payload. "
+            "Treat direct_evidence as the strongest verbatim evidence. "
+            "Use session_windows to recover local conversational context and reference resolution. "
+            "Use entity_facts, temporal_clues, relation_paths, and page_context only as supporting signals. "
+            if structured_context_mode
+            else "Use only the provided evidence. Carefully analyze the evidence, pay attention to timestamps, and prefer direct evidence when available. "
+        )
+        + "If multiple memories conflict, prioritize the most recent well-supported memory. "
         "Always convert relative time references into specific dates, months, or years when the evidence allows. "
         "Focus only on the people and facts actually supported by the memories. "
         "The final answer should be a precise, concise phrase, usually under 5 to 6 words. "
@@ -871,13 +973,25 @@ def build_answer_messages(
             "For list or set questions, include every supported item once, comma-separated. "
             "For how, method, or activity questions, return only the activity phrase."
         )
-    user_content = (answer_view_text or "").strip()
-    if not user_content:
-        context = "\n".join(context_lines).strip() or "(no retrieved evidence)"
-        user_content = (
-            f"Question: {question}\n\n"
-            f"Evidence:\n{context}"
+    if structured_context_mode:
+        user_content = json.dumps(
+            build_structured_answer_payload(
+                question,
+                evidence=evidence,
+                answer_view=answer_view or {},
+                context_lines=context_lines,
+            ),
+            ensure_ascii=False,
+            indent=2,
         )
+    else:
+        user_content = (answer_view_text or "").strip()
+        if not user_content:
+            context = "\n".join(context_lines).strip() or "(no retrieved evidence)"
+            user_content = (
+                f"Question: {question}\n\n"
+                f"Evidence:\n{context}"
+            )
     return [
         {
             "role": "system",
@@ -1194,6 +1308,7 @@ def build_payload(
         "snapshot_limit": args.snapshot_limit,
         "raw_span_limit": args.raw_span_limit,
         "answer_view_mode": args.answer_view_mode,
+        "answer_style": args.answer_style,
         "ingest_prepare_workers": int(os.environ.get("LEAF_INGEST_PREPARE_WORKERS", "4") or "4"),
         "sample_limit": args.sample_limit,
         "qa_per_sample": args.qa_per_sample,
@@ -1239,6 +1354,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--snapshot-limit", type=int, default=8)
     parser.add_argument("--raw-span-limit", type=int, default=8)
     parser.add_argument("--answer-view-mode", choices=["heuristic", "extractive"], default="heuristic")
+    parser.add_argument("--answer-style", choices=["short", "structured_context"], default="short")
     parser.add_argument("--ingest-prepare-workers", type=int, default=0)
     parser.add_argument("--ingest-mode", choices=["online", "migration"], default=None)
     parser.add_argument("--refresh", action="store_true")
@@ -1368,6 +1484,8 @@ def main() -> None:
                         evidence=evidence,
                         context_lines=context_lines,
                         answer_view_text=answer_view_text,
+                        answer_view=answer_view,
+                        answer_style=args.answer_style,
                     )
                     answer_prompt_input_tokens_est = estimate_message_tokens(answer_messages)
                     answer_input_tokens_est = answer_prompt_input_tokens_est
@@ -1408,6 +1526,7 @@ def main() -> None:
                     "answer_prompt_input_tokens_est": answer_prompt_input_tokens_est,
                     "answer_prompt_used": answer_prompt_used,
                     "answer_prompt_mode": answer_prompt_mode,
+                    "answer_style": args.answer_style,
                     "heuristic_bypass_triggered": heuristic_bypass_triggered,
                     "heuristic_bypass_enabled": heuristic_bypass_enabled,
                     "heuristic_bypass_used": heuristic_bypass_used,

@@ -451,6 +451,44 @@ class SQLiteMemoryStore:
         ).fetchone()
         return self._row_to_version(row) if row else None
 
+    def get_latest_versions(self, object_ids: list[str]) -> dict[str, MemoryObjectVersionRecord]:
+        normalized_ids = [str(object_id).strip() for object_id in object_ids if str(object_id).strip()]
+        if not normalized_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        rows = self.conn.execute(
+            f"""
+            select o.object_id as lookup_object_id, v.*
+            from leaf_objects o
+            join leaf_object_versions v on v.version_id = o.latest_version_id
+            where o.object_id in ({placeholders})
+            """,
+            tuple(normalized_ids),
+        ).fetchall()
+        return {
+            str(row["lookup_object_id"]): self._row_to_version(row)
+            for row in rows
+        }
+
+    def get_object_versions_for_objects(self, object_ids: list[str]) -> dict[str, list[MemoryObjectVersionRecord]]:
+        normalized_ids = [str(object_id).strip() for object_id in object_ids if str(object_id).strip()]
+        if not normalized_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        rows = self.conn.execute(
+            f"""
+            select *
+            from leaf_object_versions
+            where object_id in ({placeholders})
+            order by object_id, coalesce(valid_from, ''), version_id
+            """,
+            tuple(normalized_ids),
+        ).fetchall()
+        grouped: dict[str, list[MemoryObjectVersionRecord]] = {object_id: [] for object_id in normalized_ids}
+        for row in rows:
+            grouped.setdefault(str(row["object_id"]), []).append(self._row_to_version(row))
+        return grouped
+
     def get_active_versions_for_subject(self, corpus_id: str, subject: str) -> list[MemoryObjectVersionRecord]:
         rows = self.conn.execute(
             """
@@ -534,6 +572,24 @@ class SQLiteMemoryStore:
             (corpus_id, *normalized_ids),
         ).fetchall()
         return [self._row_to_event(row) for row in rows]
+
+    def get_events_by_ids(self, event_ids: list[str]) -> dict[str, MemoryEventRecord]:
+        normalized_ids = [str(event_id).strip() for event_id in event_ids if str(event_id).strip()]
+        if not normalized_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        rows = self.conn.execute(
+            f"""
+            select *
+            from leaf_events
+            where event_id in ({placeholders})
+            """,
+            tuple(normalized_ids),
+        ).fetchall()
+        return {
+            str(row["event_id"]): self._row_to_event(row)
+            for row in rows
+        }
 
     def list_subject_event_ids(self, corpus_id: str) -> list[tuple[str, str]]:
         rows = self.conn.execute(

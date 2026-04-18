@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 import os
 import re
+import threading
 from collections import Counter
 from functools import lru_cache
+from pathlib import Path
 
 from .normalize import EntityResolver, canonicalize_entity
 from .clients import (
@@ -649,17 +652,21 @@ class AtomExtractor:
     def __init__(self, llm: ChatClient | None = None):
         self.llm = llm
         self._runtime_metrics: dict[str, int] | None = None
+        self._runtime_metrics_lock = threading.Lock()
+        self._cache_dir = self._resolve_cache_dir()
 
     def reset_runtime_metrics(self) -> None:
-        self._runtime_metrics = {
-            "atom_prompt_tokens_total": 0,
-            "atom_prompt_tokens_provider_usage_calls": 0,
-            "atom_prompt_tokens_estimated_calls": 0,
-        }
+        with self._runtime_metrics_lock:
+            self._runtime_metrics = {
+                "atom_prompt_tokens_total": 0,
+                "atom_prompt_tokens_provider_usage_calls": 0,
+                "atom_prompt_tokens_estimated_calls": 0,
+            }
 
     def consume_runtime_metrics(self) -> dict[str, int]:
-        metrics = dict(self._runtime_metrics or {})
-        self._runtime_metrics = None
+        with self._runtime_metrics_lock:
+            metrics = dict(self._runtime_metrics or {})
+            self._runtime_metrics = None
         return metrics
 
     def extract_atoms(self, span: RawSpan) -> list[MemoryAtom]:
@@ -734,6 +741,10 @@ class AtomExtractor:
     def _llm_atoms(self, span: RawSpan) -> list[MemoryAtom]:
         if self.llm is None:
             return []
+        cache_key = self._atom_cache_key(span)
+        cached_atoms = self._load_cached_llm_atoms(span=span, cache_key=cache_key)
+        if cached_atoms is not None:
+            return cached_atoms
         messages = [
             {
                 "role": "system",
@@ -769,6 +780,7 @@ class AtomExtractor:
             entities = [str(entity) for entity in item.get("entities") or []]
             confidence = float(item.get("confidence", 0.6))
             atoms.append(self._make_atom(span, atom_type, content, entities, confidence))
+        self._store_cached_llm_atoms(span=span, cache_key=cache_key, atoms=atoms)
         return atoms
 
     @staticmethod
@@ -800,19 +812,112 @@ class AtomExtractor:
         )
 
     def _record_prompt_tokens(self, *, prompt_tokens: int, from_provider_usage: bool) -> None:
-        if not isinstance(self._runtime_metrics, dict):
+        with self._runtime_metrics_lock:
+            if not isinstance(self._runtime_metrics, dict):
+                return
+            self._runtime_metrics["atom_prompt_tokens_total"] = int(
+                self._runtime_metrics.get("atom_prompt_tokens_total", 0)
+            ) + int(prompt_tokens)
+            if from_provider_usage:
+                self._runtime_metrics["atom_prompt_tokens_provider_usage_calls"] = int(
+                    self._runtime_metrics.get("atom_prompt_tokens_provider_usage_calls", 0)
+                ) + 1
+            else:
+                self._runtime_metrics["atom_prompt_tokens_estimated_calls"] = int(
+                    self._runtime_metrics.get("atom_prompt_tokens_estimated_calls", 0)
+                ) + 1
+
+    def _resolve_cache_dir(self) -> Path | None:
+        if _env_enabled("LEAF_DISABLE_ATOM_CACHE"):
+            return None
+        raw_dir = os.environ.get("LEAF_ATOM_CACHE_DIR", "").strip()
+        if not raw_dir:
+            raw_dir = os.path.expanduser("~/.cache/leaf/atom_extraction")
+        try:
+            path = Path(raw_dir)
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except OSError:
+            return None
+
+    def _atom_cache_key(self, span: RawSpan) -> str:
+        language_mode = get_language_mode()
+        model_name = str(getattr(getattr(self.llm, "config", None), "model_name", "") or "")
+        base_url = str(getattr(getattr(self.llm, "config", None), "base_url", "") or "")
+        prompt_revision = "atom_prompt_v1"
+        digest = hashlib.sha1(
+            "||".join(
+                [
+                    language_mode,
+                    prompt_revision,
+                    model_name,
+                    base_url,
+                    str(span.speaker or ""),
+                    str(span.text or ""),
+                ]
+            ).encode("utf-8")
+        ).hexdigest()
+        return digest
+
+    def _cache_file_path(self, cache_key: str) -> Path | None:
+        if self._cache_dir is None:
+            return None
+        return self._cache_dir / f"{cache_key}.json"
+
+    def _load_cached_llm_atoms(self, *, span: RawSpan, cache_key: str) -> list[MemoryAtom] | None:
+        cache_path = self._cache_file_path(cache_key)
+        if cache_path is None or not cache_path.exists():
+            return None
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        items = payload.get("atoms")
+        if not isinstance(items, list):
+            return None
+        atoms: list[MemoryAtom] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            atom_type = str(item.get("type") or "").strip().lower()
+            content = str(item.get("content") or "").strip()
+            if not atom_type or not content:
+                continue
+            entities = [str(entity) for entity in item.get("entities") or []]
+            try:
+                confidence = float(item.get("confidence", 0.6))
+            except (TypeError, ValueError):
+                confidence = 0.6
+            atoms.append(self._make_atom(span, atom_type, content, entities, confidence))
+        return atoms
+
+    def _store_cached_llm_atoms(self, *, span: RawSpan, cache_key: str, atoms: list[MemoryAtom]) -> None:
+        cache_path = self._cache_file_path(cache_key)
+        if cache_path is None:
             return
-        self._runtime_metrics["atom_prompt_tokens_total"] = int(
-            self._runtime_metrics.get("atom_prompt_tokens_total", 0)
-        ) + int(prompt_tokens)
-        if from_provider_usage:
-            self._runtime_metrics["atom_prompt_tokens_provider_usage_calls"] = int(
-                self._runtime_metrics.get("atom_prompt_tokens_provider_usage_calls", 0)
-            ) + 1
-        else:
-            self._runtime_metrics["atom_prompt_tokens_estimated_calls"] = int(
-                self._runtime_metrics.get("atom_prompt_tokens_estimated_calls", 0)
-            ) + 1
+        payload = {
+            "atoms": [
+                {
+                    "type": atom.atom_type,
+                    "content": atom.content,
+                    "entities": list(atom.entities or []),
+                    "confidence": atom.confidence,
+                }
+                for atom in atoms
+            ]
+        }
+        temp_path = cache_path.with_suffix(".tmp")
+        try:
+            temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            temp_path.replace(cache_path)
+        except OSError:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except OSError:
+                pass
 
 
 def build_graph_edges(span: RawSpan, atoms: list[MemoryAtom]) -> list[GraphEdge]:
