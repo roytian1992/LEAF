@@ -1,20 +1,27 @@
 llm:
   provider: openai
-  model_name: your-answer-model
-  api_key: your-api-key
-  base_url: http://your-answer-endpoint/v1
+  model_name: ""
+  api_key: ""
+  base_url: ""
+  temperature: 0.0
+  max_tokens: 256
+  timeout: 120
 
 embedding:
   provider: openai
-  model_name: your-embedding-model
-  api_key: your-api-key
-  base_url: http://your-embedding-endpoint/v1
+  model_name: ""
+  api_key: ""
+  base_url: ""
+  timeout: 60
 
-additional_llm:
+memory_llm:
   provider: openai
-  model_name: your-memory-model
-  api_key: your-memory-model-key
-  base_url: http://your-memory-model-endpoint/v1
+  model_name: ""
+  api_key: ""
+  base_url: ""
+  temperature: 0.0
+  max_tokens: 512
+  timeout: 120
 
 ingest:
   mode: online
@@ -22,3 +29,6 @@ ingest:
   migration_build_entity_facets: false
   migration_build_entity_bridges: false
   migration_bridge_mode: hybrid
+
+language:
+  mode: en

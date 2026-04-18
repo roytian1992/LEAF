@@ -24,8 +24,8 @@ class LEAFService:
         self._search_corpus_cache: dict[str, dict[str, Any]] = {}
         self.llm = ChatClient(self.config.llm) if self.config.llm.base_url else None
         self.memory_llm = (
-            ChatClient(self.config.additional_llm)
-            if self.config.additional_llm and self.config.additional_llm.base_url
+            ChatClient(self.config.memory_llm)
+            if self.config.memory_llm and self.config.memory_llm.base_url
             else self.llm
         )
         self.embedding = EmbeddingClient(self.config.embedding) if self.config.embedding.base_url else None

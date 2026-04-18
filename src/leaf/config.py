@@ -35,7 +35,7 @@ class LanguageConfig:
 class LEAFConfig:
     llm: ModelConfig
     embedding: ModelConfig
-    additional_llm: ModelConfig | None = None
+    memory_llm: ModelConfig | None = None
     ingest: IngestConfig | None = None
     language: LanguageConfig | None = None
 
@@ -77,13 +77,23 @@ def _load_language_config(section: dict) -> LanguageConfig:
     return LanguageConfig(mode=mode)
 
 
+def _load_optional_model_config(section: dict | None) -> ModelConfig | None:
+    payload = dict(section or {})
+    if not payload:
+        return None
+    return _load_model_config(payload)
+
+
 def load_config(path: str | Path) -> LEAFConfig:
     with open(path, "r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle) or {}
+    memory_section = payload.get("memory_llm")
+    if not memory_section:
+        memory_section = payload.get("additional_llm")
     return LEAFConfig(
         llm=_load_model_config(payload.get("llm") or {}),
         embedding=_load_model_config(payload.get("embedding") or {}),
-        additional_llm=_load_model_config(payload.get("additional_llm") or {}) if (payload.get("additional_llm") or {}) else None,
+        memory_llm=_load_optional_model_config(memory_section),
         ingest=_load_ingest_config(payload.get("ingest") or {}),
         language=_load_language_config(payload.get("language") or {}),
     )
