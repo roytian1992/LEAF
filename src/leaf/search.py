@@ -18,6 +18,8 @@ from .grounding import (
     query_tokens as make_query_tokens,
     split_text_fragments,
 )
+from .hybrid_retrieval import build_hybrid_corpus_index, hybrid_rank_event_boosts
+from .memory_overlay import extract_geo_terms
 from .store import SQLiteMemoryStore
 from .agentic_memory import tokenize as tokenize_topic_text, topic_slug
 
@@ -361,6 +363,57 @@ LEXICAL_EDGE_SEED_LIMIT = 12
 LEXICAL_EDGE_TOKEN_LIMIT = 6
 TOPIC_RERANK_ENABLED = str(os.environ.get("LEAF_TOPIC_RERANK", "")).strip().lower() in {"1", "true", "yes", "on"}
 TOPIC_RERANK_MAX_BONUS = float(os.environ.get("LEAF_TOPIC_RERANK_MAX_BONUS", "0.16") or "0.16")
+MEM0_HYBRID_ENABLED = str(os.environ.get("LEAF_MEM0_HYBRID", "")).strip().lower() in {"1", "true", "yes", "on"}
+MEM0_HYBRID_TOP_K = int(os.environ.get("LEAF_MEM0_HYBRID_TOP_K", "96") or "96")
+MEM0_HYBRID_MAX_BONUS = float(os.environ.get("LEAF_MEM0_HYBRID_MAX_BONUS", "0.18") or "0.18")
+MEM0_HYBRID_FINAL_WEIGHT = float(os.environ.get("LEAF_MEM0_HYBRID_FINAL_WEIGHT", "0.25") or "0.25")
+MEM0_HYBRID_CANDIDATE_ONLY = str(os.environ.get("LEAF_MEM0_HYBRID_CANDIDATE_ONLY", "1")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+MEM0_HYBRID_ALLOW_TEMPORAL = str(os.environ.get("LEAF_MEM0_HYBRID_ALLOW_TEMPORAL", "")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+ADDITIVE_SIDECAR_ENABLED = str(os.environ.get("LEAF_ADDITIVE_SIDECAR", "")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+ADDITIVE_SIDECAR_LIMIT = int(os.environ.get("LEAF_ADDITIVE_SIDECAR_LIMIT", "4") or "4")
+ADDITIVE_SIDECAR_SOURCES = {
+    item.strip()
+    for item in str(os.environ.get("LEAF_ADDITIVE_SIDECAR_SOURCES", "") or "").split(",")
+    if item.strip()
+}
+ADDITIVE_SIDECAR_MIN_SCORE = float(os.environ.get("LEAF_ADDITIVE_SIDECAR_MIN_SCORE", "0.04") or "0.04")
+ADDITIVE_SIDECAR_ALLOW_TEMPORAL = str(os.environ.get("LEAF_ADDITIVE_SIDECAR_ALLOW_TEMPORAL", "")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+SHARED_PROFILE_OVERLAY_ENABLED = str(os.environ.get("LEAF_SHARED_PROFILE_OVERLAY", "")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+SHARED_PROFILE_OVERLAY_LIMIT = int(os.environ.get("LEAF_SHARED_PROFILE_OVERLAY_LIMIT", "4") or "4")
+SHARED_PROFILE_GEO_MODE = str(os.environ.get("LEAF_SHARED_PROFILE_GEO_MODE", "broad") or "broad").strip().lower()
+SHARED_PROFILE_GEO_ANNOTATE = str(os.environ.get("LEAF_SHARED_PROFILE_GEO_ANNOTATE", "")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+SHARED_PROFILE_OVERLAY_MODE = str(os.environ.get("LEAF_SHARED_PROFILE_OVERLAY_MODE", "support") or "support").strip().lower()
+SHARED_PROFILE_MAX_BOOST = float(os.environ.get("LEAF_SHARED_PROFILE_MAX_BOOST", "0.14") or "0.14")
 
 GENERIC_EDGE_TOKENS = {
     "amazing",
@@ -386,6 +439,30 @@ GENERIC_EDGE_TOKENS = {
     "thanks",
     "thank",
     "wonderful",
+    "wow",
+}
+
+GEO_ENTITY_NOISE = {
+    "appreciate",
+    "asked",
+    "been",
+    "decide",
+    "found",
+    "got",
+    "great",
+    "hey",
+    "hey gina",
+    "hi",
+    "never",
+    "nice",
+    "only",
+    "spot",
+    "still",
+    "thanks",
+    "took",
+    "visit",
+    "visited",
+    "where",
     "wow",
 }
 
@@ -693,6 +770,23 @@ def event_to_primary_raw_span(event: Any) -> dict[str, Any]:
         "turn_index": event.turn_index,
         "timestamp": event.timestamp,
         "metadata": dict(event.metadata or {}),
+    }
+
+
+def additive_memory_to_raw_span(memory: Any, event: Any | None = None) -> dict[str, Any]:
+    metadata = dict(getattr(memory, "metadata", None) or {})
+    metadata["memory_sidecar"] = "additive"
+    metadata["additive_memory_id"] = str(getattr(memory, "memory_id", "") or "")
+    metadata["linked_atom_ids"] = list(getattr(memory, "linked_atom_ids", []) or [])
+    return {
+        "span_id": f"addmem:{getattr(memory, 'memory_id', '')}",
+        "corpus_id": getattr(memory, "corpus_id", getattr(event, "corpus_id", "")),
+        "session_id": getattr(event, "session_id", ""),
+        "speaker": getattr(memory, "attributed_to", "") or getattr(event, "speaker", "memory"),
+        "text": getattr(memory, "text", ""),
+        "turn_index": int(getattr(event, "turn_index", 0) or 0),
+        "timestamp": getattr(memory, "timestamp", None) or getattr(event, "timestamp", None),
+        "metadata": metadata,
     }
 
 
@@ -1065,6 +1159,39 @@ def retrieve_leaf_memory(
         "event_bonus_count": 0,
         "max_bonus": 0.0,
     }
+    mem0_hybrid_diagnostics: dict[str, Any] = {
+        "enabled": bool(MEM0_HYBRID_ENABLED),
+        "top_k": int(MEM0_HYBRID_TOP_K),
+        "max_bonus": float(MEM0_HYBRID_MAX_BONUS),
+        "final_weight": float(MEM0_HYBRID_FINAL_WEIGHT),
+        "candidate_only": bool(MEM0_HYBRID_CANDIDATE_ONLY),
+        "allow_temporal": bool(MEM0_HYBRID_ALLOW_TEMPORAL),
+        "skipped_reason": "",
+        "matched_event_count": 0,
+        "ranked_event_ids": [],
+        "query_terms": [],
+        "query_entities": [],
+    }
+    additive_sidecar_diagnostics: dict[str, Any] = {
+        "enabled": bool(ADDITIVE_SIDECAR_ENABLED),
+        "available_memory_count": 0,
+        "selected_memory_count": 0,
+        "limit": int(ADDITIVE_SIDECAR_LIMIT),
+        "sources": sorted(ADDITIVE_SIDECAR_SOURCES),
+        "min_score": float(ADDITIVE_SIDECAR_MIN_SCORE),
+        "allow_temporal": bool(ADDITIVE_SIDECAR_ALLOW_TEMPORAL),
+        "skipped_reason": "",
+    }
+    shared_profile_diagnostics: dict[str, Any] = {
+        "enabled": bool(SHARED_PROFILE_OVERLAY_ENABLED),
+        "selected_event_count": 0,
+        "limit": int(SHARED_PROFILE_OVERLAY_LIMIT),
+        "triggered": False,
+        "reason": "",
+        "geo_mode": SHARED_PROFILE_GEO_MODE,
+        "overlay_mode": SHARED_PROFILE_OVERLAY_MODE,
+        "boosted_event_count": 0,
+    }
 
     def score_embedding(vector: list[float] | None) -> float:
         if not vector:
@@ -1303,6 +1430,66 @@ def retrieve_leaf_memory(
             cached = event_to_raw_spans(event)
             event_raw_spans_cache[event_id] = cached
         return cached
+
+    def event_geo_candidate_terms(event: Any, *, speaker_names: list[str]) -> set[str]:
+        text = str(event.text or "")
+        refs = [str(item).strip() for item in (event.canonical_entity_refs or event.entity_refs or []) if str(item).strip()]
+        noise = {str(item).strip().lower() for item in speaker_names}
+        noise.update(GEO_ENTITY_NOISE)
+
+        def clean_geo_candidates(raw_refs: list[str]) -> set[str]:
+            cleaned: set[str] = set()
+            for ref in raw_refs:
+                normalized = str(ref or "").strip().lower()
+                if not normalized or normalized in noise:
+                    continue
+                if len(normalized) < 3 or len(normalized.split()) > 3:
+                    continue
+                if any(token in QUERY_STOPWORDS or token in noise for token in normalized.split()):
+                    continue
+                cleaned.add(normalized)
+            return cleaned
+
+        if not re.search(r"\b(city|place|places|where|visit|visited|travel|trip|been to|went to|go to)\b", text, re.IGNORECASE):
+            return set(extract_geo_terms(" ".join([text, " ".join(refs)])))
+
+        if SHARED_PROFILE_GEO_MODE in {"broad", "ner_broad"}:
+            terms = set(extract_geo_terms(" ".join([text, " ".join(refs)])))
+            terms.update(clean_geo_candidates(cached_extract_entities(text)))
+            return terms
+
+        positive_terms: set[str] = set()
+        for fragment in split_text_fragments(text):
+            lowered_fragment = fragment.lower()
+            if not re.search(r"\b(visit|visited|travel|trip|been to|went to|go to|took .* trip)\b", lowered_fragment):
+                continue
+            if re.search(r"\b(never|not|no chance|haven't|hasn't|hadn't|didn't)\b", lowered_fragment):
+                continue
+            fragment_terms = set(extract_geo_terms(fragment))
+            fragment_terms.update(clean_geo_candidates(cached_extract_entities(fragment)))
+            positive_terms.update(fragment_terms)
+        if positive_terms:
+            return positive_terms
+        return set(extract_geo_terms(" ".join([text, " ".join(refs)])))
+
+    def append_profile_overlay_span(event: Any, *, reason: str, shared_terms: list[str]) -> bool:
+        span = event_to_primary_raw_span(event)
+        span_id = str(span.get("span_id") or "").strip()
+        if not span_id or span_id in seen_span_ids:
+            return False
+        metadata = dict(span.get("metadata") or {})
+        metadata["memory_overlay"] = {
+            "source": "shared_profile_v1",
+            "sources": ["shared_profile_v1"],
+            "reason": reason,
+            "shared_terms": list(shared_terms[:8]),
+        }
+        span["metadata"] = metadata
+        if shared_terms and str(reason).startswith("shared_geo:") and SHARED_PROFILE_GEO_ANNOTATE:
+            span["text"] = f"{span.get('text', '')} Shared candidate place(s): {', '.join(shared_terms[:4])}."
+        supporting_raw_spans.append(span)
+        seen_span_ids.add(span_id)
+        return True
 
     def score_snapshot(snapshot: Any) -> float:
         snapshot_id = str(snapshot.snapshot_id)
@@ -1543,6 +1730,36 @@ def retrieve_leaf_memory(
     ordered_session_ids: list[str] = list((corpus_cache or {}).get("ordered_session_ids") or [])
     shared_cache = corpus_cache if corpus_cache is not None else {}
 
+    needs_hybrid_index = bool(MEM0_HYBRID_ENABLED)
+    needs_additive_memories = bool(MEM0_HYBRID_ENABLED or ADDITIVE_SIDECAR_ENABLED)
+    all_atoms: list[Any] = []
+    if needs_hybrid_index:
+        all_atoms = list((corpus_cache or {}).get("all_atoms") or [])
+        if not all_atoms:
+            all_atoms = store.list_atoms(corpus_id=corpus_id)
+            if corpus_cache is not None:
+                corpus_cache["all_atoms"] = all_atoms
+    additive_memories: list[Any] = []
+    if needs_additive_memories:
+        additive_memories = list((corpus_cache or {}).get("additive_memories") or [])
+        if not additive_memories:
+            additive_memories = store.list_additive_memories(corpus_id=corpus_id)
+            if corpus_cache is not None:
+                corpus_cache["additive_memories"] = additive_memories
+    additive_sidecar_diagnostics["available_memory_count"] = len(additive_memories)
+    additive_by_event: dict[str, list[Any]] = defaultdict(list)
+    filtered_additive_count = 0
+    for memory in additive_memories:
+        metadata = dict(getattr(memory, "metadata", None) or {})
+        source = str(metadata.get("source") or "").strip()
+        if ADDITIVE_SIDECAR_SOURCES and source not in ADDITIVE_SIDECAR_SOURCES:
+            continue
+        filtered_additive_count += 1
+        event_id = str(getattr(memory, "event_id", "") or "").strip()
+        if event_id:
+            additive_by_event[event_id].append(memory)
+    additive_sidecar_diagnostics["usable_memory_count"] = filtered_additive_count
+
     corpus_index_started_at = time.perf_counter()
     token_to_event_ids = shared_cache.get("token_to_event_ids")
     if token_to_event_ids is None:
@@ -1646,6 +1863,7 @@ def retrieve_leaf_memory(
     candidate_events: list[Any] = []
     candidate_event_ids: set[str] = set()
     candidate_bonus_by_event: dict[str, float] = defaultdict(float)
+    shared_profile_boost_by_event: dict[str, float] = defaultdict(float)
 
     def append_candidate(event: Any | None) -> None:
         if event is None or event.event_id in candidate_event_ids:
@@ -1824,6 +2042,55 @@ def retrieve_leaf_memory(
             break
     stage_timings_ms["candidate_pool_fill"] = round((time.perf_counter() - candidate_pool_fill_started_at) * 1000.0, 2)
 
+    mem0_hybrid_started_at = time.perf_counter()
+    mem0_hybrid_boost_by_event: dict[str, float] = {}
+    if MEM0_HYBRID_ENABLED and prefer_temporal_focus and not MEM0_HYBRID_ALLOW_TEMPORAL:
+        mem0_hybrid_diagnostics["skipped_reason"] = "temporal_query"
+    elif MEM0_HYBRID_ENABLED:
+        hybrid_index = shared_cache.get("mem0_hybrid_index")
+        if hybrid_index is None:
+            hybrid_index = build_hybrid_corpus_index(
+                events=all_events,
+                atoms=all_atoms,
+                additive_memories=additive_memories,
+                additive_sources=ADDITIVE_SIDECAR_SOURCES,
+                language_mode=language_mode,
+            )
+            if corpus_cache is not None:
+                corpus_cache["mem0_hybrid_index"] = hybrid_index
+        candidate_ids_for_hybrid = (
+            [event.event_id for event in candidate_events]
+            if MEM0_HYBRID_CANDIDATE_ONLY
+            else None
+        )
+        hybrid_payload = hybrid_rank_event_boosts(
+            question=question,
+            index=hybrid_index,
+            candidate_event_ids=candidate_ids_for_hybrid,
+            language_mode=language_mode,
+            top_k=MEM0_HYBRID_TOP_K,
+        )
+        mem0_hybrid_boost_by_event = {
+            str(event_id): min(float(MEM0_HYBRID_MAX_BONUS), float(boost))
+            for event_id, boost in dict(hybrid_payload.get("boost_by_event") or {}).items()
+        }
+        for event_id in list(hybrid_payload.get("ranked_event_ids") or [])[: max(raw_span_limit * 6, 24)]:
+            event = event_lookup.get(str(event_id))
+            if event is None:
+                continue
+            append_candidate(event)
+        mem0_hybrid_diagnostics.update(
+            {
+                "matched_event_count": int(hybrid_payload.get("matched_event_count") or 0),
+                "ranked_event_ids": list(hybrid_payload.get("ranked_event_ids") or [])[:12],
+                "query_terms": list(hybrid_payload.get("query_terms") or [])[:16],
+                "query_entities": list(hybrid_payload.get("query_entities") or [])[:16],
+                "diagnostics_by_event": dict(hybrid_payload.get("diagnostics_by_event") or {}),
+                "max_raw_score": hybrid_payload.get("max_raw_score"),
+            }
+        )
+    stage_timings_ms["mem0_hybrid_retrieval"] = round((time.perf_counter() - mem0_hybrid_started_at) * 1000.0, 2)
+
     session_local_mining_started_at = time.perf_counter()
     if enable_speaker_session_mining:
         ranked_focus_sessions: list[str] = []
@@ -1886,6 +2153,94 @@ def retrieve_leaf_memory(
                     break
     stage_timings_ms["session_local_mining"] = round((time.perf_counter() - session_local_mining_started_at) * 1000.0, 2)
 
+    shared_profile_boost_started_at = time.perf_counter()
+    shared_profile_query = bool(
+        SHARED_PROFILE_OVERLAY_ENABLED
+        and not prefer_temporal_focus
+        and re.search(r"\b(both|common|shared|same|similar|alike)\b", lowered_question)
+    )
+    shared_profile_pairs: list[tuple[float, str, Any, Any, list[str]]] = []
+    if shared_profile_query:
+        shared_profile_diagnostics["triggered"] = True
+        geo_shared_query = bool(re.search(r"\b(city|cities|place|places|where|visit|visited|travel|trip)\b", lowered_question))
+        shared_profile_diagnostics["geo_shared_query"] = geo_shared_query
+        speaker_names = [
+            str(item).strip().lower()
+            for item in _ordered_unique_strings(
+                [str(event.speaker or "") for event in all_events if str(event.speaker or "").strip()]
+            )
+            if str(item).strip()
+        ]
+        if len(speaker_names) < 2:
+            shared_profile_diagnostics["reason"] = "not_enough_speakers"
+        else:
+            speaker_rows: dict[str, list[tuple[float, Any, set[str]]]] = defaultdict(list)
+            for event in all_events:
+                speaker = str(event.speaker or "").strip().lower()
+                if speaker not in speaker_names:
+                    continue
+                geo_terms = event_geo_candidate_terms(event, speaker_names=speaker_names)
+                if geo_shared_query:
+                    tokens = geo_terms
+                else:
+                    tokens = {
+                        token
+                        for token in cached_edge_tokens(event)
+                        if float((token_df_ratio or {}).get(token, 0.0)) <= 0.34
+                        and token not in {"both", "common", "shared", "same", "similar"}
+                    }
+                    if geo_terms and re.search(r"\b(place|visit|visited|travel|trip)\b", str(event.text or ""), re.IGNORECASE):
+                        tokens.update(geo_terms)
+                if not tokens:
+                    continue
+                base = float(event_base_scores.get(event.event_id, 0.0))
+                base += min(0.32, len(normalized_query_terms.intersection(tokens)) * 0.08)
+                base += min(0.22, len(set(cached_event_support_refs(event)).intersection(normalized_query_terms)) * 0.06)
+                if geo_shared_query and geo_terms:
+                    base += 0.35
+                base += 0.02 * min(4, len(tokens))
+                speaker_rows[speaker].append((base, event, tokens))
+            for speaker in list(speaker_rows):
+                speaker_rows[speaker].sort(key=lambda item: item[0], reverse=True)
+                speaker_rows[speaker] = speaker_rows[speaker][:64]
+
+            for left_index, left_speaker in enumerate(speaker_names):
+                for right_speaker in speaker_names[left_index + 1 :]:
+                    for left_score, left_event, left_tokens in speaker_rows.get(left_speaker, []):
+                        for right_score, right_event, right_tokens in speaker_rows.get(right_speaker, []):
+                            shared_tokens = left_tokens.intersection(right_tokens)
+                            if not shared_tokens:
+                                continue
+                            shared_weight = sum(float((token_idf or {}).get(token, 1.0)) for token in shared_tokens)
+                            if shared_weight < (0.5 if geo_shared_query else 2.0):
+                                continue
+                            query_weight = len(shared_tokens.intersection(normalized_query_terms)) * 0.2
+                            score = shared_weight * 0.08 + (left_score + right_score) * 0.12 + query_weight
+                            if geo_shared_query:
+                                score += 0.8
+                            shared_profile_pairs.append(
+                                (
+                                    score,
+                                    f"{left_speaker}+{right_speaker}",
+                                    left_event,
+                                    right_event,
+                                    sorted(shared_tokens, key=lambda token: (-float((token_idf or {}).get(token, 1.0)), token))[:8],
+                                )
+                            )
+            shared_profile_pairs.sort(key=lambda item: (-item[0], item[1]))
+            for score, _speaker_pair, left_event, right_event, _shared_terms in shared_profile_pairs[: max(2, int(SHARED_PROFILE_OVERLAY_LIMIT))]:
+                boost = min(float(SHARED_PROFILE_MAX_BOOST), max(0.0, score * 0.04))
+                if boost <= 0.0:
+                    continue
+                for event in (left_event, right_event):
+                    shared_profile_boost_by_event[event.event_id] = max(shared_profile_boost_by_event[event.event_id], boost)
+                    candidate_bonus_by_event[event.event_id] += boost
+                    append_candidate(event)
+            shared_profile_diagnostics["boosted_event_count"] = len(shared_profile_boost_by_event)
+            if not shared_profile_pairs:
+                shared_profile_diagnostics["reason"] = "no_shared_profile_pair"
+    stage_timings_ms["shared_profile_boost"] = round((time.perf_counter() - shared_profile_boost_started_at) * 1000.0, 2)
+
     atom_score_by_event: dict[str, float] = defaultdict(float)
     atom_score_rows: list[tuple[float, Any]] = []
     atom_rerank_started_at = time.perf_counter()
@@ -1938,6 +2293,7 @@ def retrieve_leaf_memory(
                 float(event_base_scores.get(event.event_id, 0.0))
                 + float(candidate_bonus_by_event.get(event.event_id, 0.0))
                 + float(topic_bonus_by_event.get(event.event_id, 0.0)) * 0.35
+                + float(mem0_hybrid_boost_by_event.get(event.event_id, 0.0)) * MEM0_HYBRID_FINAL_WEIGHT
             )
             matched_entities = cached_matched_query_entities(event)
             if require_entity_coverage:
@@ -2018,6 +2374,83 @@ def retrieve_leaf_memory(
             append_raw_span(event)
             if len(raw_spans) >= raw_span_limit:
                 break
+
+    additive_sidecar_started_at = time.perf_counter()
+    sidecar_allowed_for_query = bool(ADDITIVE_SIDECAR_ENABLED and additive_memories)
+    if sidecar_allowed_for_query and prefer_temporal_focus and not ADDITIVE_SIDECAR_ALLOW_TEMPORAL:
+        sidecar_allowed_for_query = False
+        additive_sidecar_diagnostics["skipped_reason"] = "temporal_query"
+    if sidecar_allowed_for_query:
+        additive_rows: list[tuple[float, int, Any, Any | None]] = []
+        selected_event_lookup = {event.event_id: event for event in selected_events}
+        candidate_event_lookup = {event.event_id: event for event in candidate_events}
+        event_lookup_for_additive = {**candidate_event_lookup, **selected_event_lookup}
+        selected_ids_for_additive = list(selected_event_ids) or [event.event_id for event in selected_events]
+        for event_id in selected_ids_for_additive:
+            event = event_lookup_for_additive.get(event_id) or event_lookup.get(event_id)
+            for memory in additive_by_event.get(str(event_id), []):
+                text = str(getattr(memory, "text", "") or "")
+                if not text.strip():
+                    continue
+                metadata = dict(getattr(memory, "metadata", None) or {})
+                source = str(metadata.get("source") or "")
+                score = 0.0
+                memory_terms = set(getattr(memory, "terms", []) or []) or cached_document_terms(text)
+                term_hits = normalized_query_terms.intersection(memory_terms)
+                score += min(0.42, len(term_hits) * 0.06)
+                memory_entities = list(getattr(memory, "canonical_entities", []) or getattr(memory, "entities", []) or [])
+                entity_score = _entity_overlap_score(query_entities, memory_entities)
+                score += min(
+                    0.24,
+                    entity_score * 0.24,
+                )
+                if source == "dialog_window_v1":
+                    score += 0.05
+                    window_event_ids = {str(item) for item in (metadata.get("window_event_ids") or [])}
+                    if window_event_ids.intersection(selected_event_ids):
+                        score += 0.04
+                    if "?" in text:
+                        score += 0.03
+                elif source == "event_atom_derived_v1":
+                    score -= 0.03
+                if event is not None:
+                    score += 0.18 * score_embedding(getattr(memory, "embedding", None) or getattr(event, "embedding", None))
+                    score += score_temporal(getattr(memory, "timestamp", None) or getattr(event, "timestamp", None)) * 0.5
+                if (
+                    score < float(ADDITIVE_SIDECAR_MIN_SCORE)
+                    and not (source == "dialog_window_v1" and (list_query or prefer_inference_support) and (term_hits or entity_score > 0.0))
+                ):
+                    continue
+                additive_rows.append((score, int(getattr(event, "turn_index", 0) or 0) if event is not None else 0, memory, event))
+        additive_rows.sort(key=lambda item: (-item[0], item[1], str(getattr(item[2], "memory_id", ""))))
+        added = 0
+        for _score, _turn_index, memory, event in additive_rows:
+            if added >= max(0, int(ADDITIVE_SIDECAR_LIMIT)):
+                break
+            span = additive_memory_to_raw_span(memory, event)
+            span_id = str(span.get("span_id") or "").strip()
+            if not span_id or span_id in seen_span_ids:
+                continue
+            supporting_raw_spans.append(span)
+            seen_span_ids.add(span_id)
+            added += 1
+        additive_sidecar_diagnostics["selected_memory_count"] = added
+    stage_timings_ms["additive_sidecar_pack"] = round((time.perf_counter() - additive_sidecar_started_at) * 1000.0, 2)
+
+    shared_profile_pack_started_at = time.perf_counter()
+    if shared_profile_pairs and SHARED_PROFILE_OVERLAY_MODE in {"support", "both"}:
+            added = 0
+            for _score, speaker_pair, left_event, right_event, shared_terms in shared_profile_pairs:
+                for event in (left_event, right_event):
+                    if added >= max(0, int(SHARED_PROFILE_OVERLAY_LIMIT)):
+                        break
+                    reason_prefix = "shared_geo" if geo_shared_query else "shared_profile"
+                    if append_profile_overlay_span(event, reason=f"{reason_prefix}:{speaker_pair}", shared_terms=shared_terms):
+                        added += 1
+                if added >= max(0, int(SHARED_PROFILE_OVERLAY_LIMIT)):
+                    break
+            shared_profile_diagnostics["selected_event_count"] = added
+    stage_timings_ms["shared_profile_overlay_pack"] = round((time.perf_counter() - shared_profile_pack_started_at) * 1000.0, 2)
 
     local_support_started_at = time.perf_counter()
     requested_local_support_mode = str(local_support_mode or "off").strip().lower()
@@ -2259,6 +2692,9 @@ def retrieve_leaf_memory(
                 "use_lexical_edge_expansion": USE_LEXICAL_EDGE_EXPANSION,
                 "use_session_local_completion": USE_SESSION_LOCAL_COMPLETION,
                 "use_topic_rerank": TOPIC_RERANK_ENABLED,
+                "use_mem0_hybrid": MEM0_HYBRID_ENABLED,
+                "use_additive_sidecar": ADDITIVE_SIDECAR_ENABLED,
+                "use_shared_profile_overlay": SHARED_PROFILE_OVERLAY_ENABLED,
                 "local_support_mode": requested_local_support_mode,
                 "local_support_policy": local_support_policy,
                 "enable_neighbor_expansion": enable_neighbor_expansion,
@@ -2267,5 +2703,8 @@ def retrieve_leaf_memory(
                 "enable_event_atom_rerank": enable_event_atom_rerank,
             },
             "topic_rerank": topic_rerank_diagnostics,
+            "mem0_hybrid": mem0_hybrid_diagnostics,
+            "additive_sidecar": additive_sidecar_diagnostics,
+            "shared_profile_overlay": shared_profile_diagnostics,
         },
     }

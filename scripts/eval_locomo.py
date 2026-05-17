@@ -1953,6 +1953,23 @@ def is_memory_overlay_span(span: dict[str, Any]) -> bool:
     return bool((dict(span.get("metadata") or {}).get("memory_overlay") or {}))
 
 
+def is_additive_sidecar_span(span: dict[str, Any]) -> bool:
+    return bool((dict(span.get("metadata") or {}).get("memory_sidecar") == "additive"))
+
+
+def strip_additive_sidecar_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+    if not evidence:
+        return evidence
+    return {
+        **evidence,
+        "supporting_raw_spans": [
+            span
+            for span in evidence.get("supporting_raw_spans") or []
+            if not (isinstance(span, dict) and is_additive_sidecar_span(span))
+        ],
+    }
+
+
 def raw_span_text_with_visual_context(span: dict[str, Any]) -> str:
     text = str(span.get("text") or "").strip()
     metadata = dict(span.get("metadata") or {})
@@ -3309,9 +3326,10 @@ def main() -> None:
                     baseline_evidence=baseline_evidence,
                     evidence=evidence,
                 )
+                postprocess_evidence = strip_additive_sidecar_evidence(answer_core_evidence)
                 effective_answer_style = resolve_effective_answer_style(args.answer_style, evidence)
                 context_lines = build_answer_context_lines(answer_core_evidence)
-                heuristic_answer = heuristic_answer_from_evidence(question=question, evidence=answer_core_evidence)
+                heuristic_answer = heuristic_answer_from_evidence(question=question, evidence=postprocess_evidence)
                 answer_view: dict[str, Any] = {}
                 answer_view_text = ""
                 answer_messages: list[dict[str, str]] = []
@@ -3397,13 +3415,13 @@ def main() -> None:
                     except OpenAICompatError as exc:
                         predicted_answer = f"__ERROR__: {exc}"
                 answer_elapsed_ms = (time.perf_counter() - answer_started) * 1000.0
-                predicted_answer = str(canonicalize_temporal_answer(question, predicted_answer, answer_core_evidence) or predicted_answer).strip()
+                predicted_answer = str(canonicalize_temporal_answer(question, predicted_answer, postprocess_evidence) or predicted_answer).strip()
                 predicted_answer_before_temporal_postprocess = predicted_answer
                 predicted_answer = str(
                     temporal_anchor_postprocess(
                         question,
                         predicted_answer,
-                        answer_core_evidence,
+                        postprocess_evidence,
                         mode=args.temporal_postprocess,
                     )
                     or predicted_answer
@@ -3415,11 +3433,13 @@ def main() -> None:
                         question,
                         predicted_answer,
                         mode=args.short_answer_postprocess,
-                        evidence=answer_core_evidence,
+                        evidence=postprocess_evidence,
                     )
                     or predicted_answer
                 ).strip()
                 short_answer_postprocess_used = predicted_answer != predicted_answer_before_short_answer_postprocess
+                retrieval_timing = dict((evidence.get("timing") or {}) if isinstance(evidence, dict) else {})
+                mem0_hybrid_payload = dict(retrieval_timing.get("mem0_hybrid") or {})
                 print(
                     f"[locomo] sample={sample_id} q={qa['question_index']} answer_done search_ms={round(search_elapsed_ms, 2)} answer_ms={round(answer_elapsed_ms, 2)}",
                     flush=True,
@@ -3461,6 +3481,12 @@ def main() -> None:
                     "short_answer_postprocess_used": short_answer_postprocess_used,
                     "retrieval_mode": args.retrieval_mode,
                     "raw_span_count": len(evidence.get("raw_spans") or []),
+                    "mem0_hybrid_enabled": bool(mem0_hybrid_payload.get("enabled")),
+                    "mem0_hybrid_matched_event_count": int(mem0_hybrid_payload.get("matched_event_count") or 0),
+                    "mem0_hybrid_ranked_event_ids": list(mem0_hybrid_payload.get("ranked_event_ids") or [])[:12],
+                    "mem0_hybrid_query_terms": list(mem0_hybrid_payload.get("query_terms") or [])[:16],
+                    "mem0_hybrid_query_entities": list(mem0_hybrid_payload.get("query_entities") or [])[:16],
+                    "mem0_hybrid_diagnostics_by_event": dict(mem0_hybrid_payload.get("diagnostics_by_event") or {}),
                     "topic_soft_event_count": len((topic_soft_payload or {}).get("event_ids") or []),
                     "topic_soft_atom_count": len((topic_soft_payload or {}).get("atom_ids") or []),
                     "topic_soft_candidate_atom_count": int((topic_soft_payload or {}).get("candidate_atom_count") or 0),
@@ -3556,6 +3582,7 @@ def main() -> None:
                         "atoms": list(evidence.get("atoms") or []),
                         "raw_spans": list(evidence.get("raw_spans") or []),
                         "supporting_raw_spans": list(evidence.get("supporting_raw_spans") or []),
+                        "timing": retrieval_timing,
                     },
                     "retrieved_dia_ids": ordered_unique(
                         [

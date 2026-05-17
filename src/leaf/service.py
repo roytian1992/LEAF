@@ -703,6 +703,8 @@ class LEAFService:
         session_blocks = self.store.list_snapshots(corpus_id=key, snapshot_kind="session_block")
         all_events = self.store.get_events(corpus_id=key)
         event_lookup = {event.event_id: event for event in all_events}
+        all_atoms = self.store.list_atoms(corpus_id=key)
+        additive_memories = self.store.list_additive_memories(corpus_id=key)
         session_turn_lookup: dict[str, dict[int, Any]] = {}
         ordered_session_ids: list[str] = []
         entity_event_ids: dict[str, list[str]] = {}
@@ -738,6 +740,8 @@ class LEAFService:
             "session_pages": session_pages,
             "session_blocks": session_blocks,
             "all_events": all_events,
+            "all_atoms": all_atoms,
+            "additive_memories": additive_memories,
             "event_lookup": event_lookup,
             "session_turn_lookup": session_turn_lookup,
             "ordered_session_ids": ordered_session_ids,

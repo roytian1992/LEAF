@@ -47,6 +47,28 @@ class MemoryAtomRecord:
 
 
 @dataclass(slots=True)
+class AdditiveMemoryRecord:
+    memory_id: str
+    corpus_id: str
+    event_id: str
+    text: str
+    attributed_to: str
+    timestamp: str | None = None
+    linked_atom_ids: list[str] = field(default_factory=list)
+    linked_memory_ids: list[str] = field(default_factory=list)
+    entities: list[str] = field(default_factory=list)
+    canonical_entities: list[str] = field(default_factory=list)
+    terms: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    embedding: list[float] | None = None
+    hash: str | None = None
+    created_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class StateCandidate:
     candidate_id: str
     corpus_id: str

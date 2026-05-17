@@ -4900,3 +4900,146 @@ Canonical reporting document updated:
 Notes:
 
 - The interrupted early LoCoMo Judge-5 progress file was renamed to `reports/agentic_memory/judge_20260518/locomo10_base_gpt54mini_qwen8002_judge5_legacybinary_20260518.judge_progress.abandoned.jsonl` and is not part of the current reporting table.
+
+## 2026-05-18 Mem0-Inspired Hybrid Sidecar
+
+Purpose:
+
+- Borrow useful ideas from current `mem0ai/mem0` without changing LEAF's base event/atom storage: ADD-only compact memory facts, lexical/BM25-style normalized terms, entity boosts, and search-time hybrid rerank without LLM calls.
+- Evaluate whether this improves the 4-corpus LoCoMo challenge subset over the current LEAF-base anchor.
+
+Code branch and backup:
+
+- Project path: `/vepfs-mlp2/c20250513/241404044/users/roytian/LEAF_agentic_memory`
+- Working branch: `feature/mem0-inspired-hybrid-memory`
+- Backup branch pushed before implementation: `backup/agentic-memory-before-mem0-inspired-20260518`
+- Backup commit: `982f7b1 backup: preserve agentic memory evolution state`
+
+Main code changes:
+
+- `src/leaf/records.py`: added `AdditiveMemoryRecord`.
+- `src/leaf/store.py`: added `leaf_additive_memories` persistence helpers.
+- `src/leaf/service.py`: cache support for all atoms and additive memories.
+- `src/leaf/hybrid_retrieval.py`: new local hybrid index over events + additive memories with BM25-style term matching and entity boost.
+- `src/leaf/search.py`: optional mem0-style hybrid boost, additive-memory source filtering, temporal guard, and shared-profile support overlay.
+- `scripts/build_additive_memory_sidecar.py`: new sidecar builder with `event_atom`, `dialog_window`, and LLM ADD-only fact modes; `llm_fact_v2` uses a mem0-inspired extraction prompt and parallel workers.
+- `scripts/eval_locomo.py`: records mem0 hybrid diagnostics and strips additive sidecar spans from deterministic postprocess.
+
+Input artifacts:
+
+- Config: `tmp/config_agentic_codeai_memory_qwen_answer.yaml`
+- Challenge input: `tmp/locomo_challenge_conv30_43_47_50_noadv.json`
+- DB used for mem0-inspired run: `data/agentic_smoke/locomo10_evolvedtopic_secondary_profileauto_llmfacts_20260518.sqlite3`
+- Baseline anchor report: `reports/agentic_memory/locomo_challenge_conv30_43_47_50_leafbase_current_qaw8_20260518.json`
+- Previous overlay anchor: `reports/agentic_memory/locomo_challenge_conv30_43_47_50_overlay_gate_v2_no_open_qaw8_20260518.json`
+
+Sidecar build:
+
+```bash
+./scripts/with_tracenav_nlp.sh python scripts/build_additive_memory_sidecar.py \
+  --config tmp/config_agentic_codeai_memory_qwen_answer.yaml \
+  --db data/agentic_smoke/locomo10_evolvedtopic_secondary_profileauto_llmfacts_20260518.sqlite3 \
+  --corpus-id locomo_conv_30 --corpus-id locomo_conv_43 \
+  --corpus-id locomo_conv_47 --corpus-id locomo_conv_50 \
+  --mode llm_facts \
+  --llm-source llm_fact_v2 \
+  --llm-extraction-policy mem0_additive_v2 \
+  --llm-window-size 8 \
+  --llm-max-facts-per-window 8 \
+  --llm-workers 6 \
+  --llm-timeout 90 \
+  --max-atoms-per-event 4 \
+  --flush-every-windows 10 \
+  --output reports/agentic_memory/locomo_challenge4_llmfact_v2_sidecar_build_retry_20260518.json
+```
+
+Sidecar output:
+
+- Report: `reports/agentic_memory/locomo_challenge4_llmfact_v2_sidecar_build_retry_20260518.json`
+- Log: `logs/locomo_challenge4_llmfact_v2_sidecar_build_retry_20260518.log`
+- `locomo_conv_30`: 343 new `llm_fact_v2` facts in retry run; 52 windows; 1 API-format error. Current DB has 723 `llm_fact_v2` rows because an earlier successful build wrote 380 rows before retry.
+- `locomo_conv_43`: 680 new `llm_fact_v2` facts; 96 windows; 0 errors. Current DB has 695 rows including a 15-row smoke build.
+- `locomo_conv_47`: 655 `llm_fact_v2` facts; 100 windows; 0 errors.
+- `locomo_conv_50`: 587 `llm_fact_v2` facts; 84 windows; 1 API-format error.
+
+Primary QA command:
+
+```bash
+LEAF_MEM0_HYBRID=1 \
+LEAF_MEM0_HYBRID_CANDIDATE_ONLY=1 \
+LEAF_MEM0_HYBRID_FINAL_WEIGHT=0.20 \
+LEAF_MEM0_HYBRID_MAX_BONUS=0.14 \
+LEAF_ADDITIVE_SIDECAR_SOURCES=llm_fact_v2 \
+LEAF_SHARED_PROFILE_OVERLAY=1 \
+LEAF_SHARED_PROFILE_OVERLAY_MODE=support \
+LEAF_SHARED_PROFILE_OVERLAY_LIMIT=2 \
+LEAF_SHARED_PROFILE_GEO_MODE=broad \
+./scripts/with_tracenav_nlp.sh python scripts/eval_locomo.py \
+  --config tmp/config_agentic_codeai_memory_qwen_answer.yaml \
+  --db data/agentic_smoke/locomo10_evolvedtopic_secondary_profileauto_llmfacts_20260518.sqlite3 \
+  --input tmp/locomo_challenge_conv30_43_47_50_noadv.json \
+  --output reports/agentic_memory/locomo4_mem0v2_llmfact_hybrid_sharedsupport_evolved_profileauto_fullsubset_20260518.json \
+  --sample-limit 4 \
+  --snapshot-limit 8 \
+  --raw-span-limit 12 \
+  --non-temporal-raw-span-limit 12 \
+  --retrieval-mode topic_soft_selective \
+  --topic-router evolved_profile_first \
+  --topic-route-top-k 3 \
+  --topic-soft-event-limit 4 \
+  --topic-soft-per-topic-atom-limit 16 \
+  --topic-soft-min-content-overlap 1 \
+  --topic-soft-secondary-policy strict_text_v0 \
+  --topic-soft-secondary-min-content-overlap 2 \
+  --topic-soft-secondary-min-route-keyword-overlap 1 \
+  --topic-soft-policy route_uncertainty_semantic_v0 \
+  --topic-soft-policy-min-selected-semantic-similarity 0.12 \
+  --topic-soft-policy-suppress-multi-route \
+  --topic-soft-fallback baseline_on_unknown \
+  --answer-style structured_context_topic_labeled \
+  --answer-evidence-mode merged \
+  --answer-view-mode heuristic \
+  --short-answer-postprocess precise
+```
+
+Primary QA result:
+
+- Report: `reports/agentic_memory/locomo4_mem0v2_llmfact_hybrid_sharedsupport_evolved_profileauto_fullsubset_20260518.json`
+- Log: `logs/locomo4_mem0v2_llmfact_hybrid_sharedsupport_fullsubset_20260518.log`
+- Completed: `true`
+- Evaluated questions: `567`
+- Overall: F1 `0.5641`, BLEU1 `0.5091`
+- Average search latency: `319.72 ms`
+
+Comparison:
+
+| Run | Q | F1 | BLEU1 |
+| --- | ---: | ---: | ---: |
+| LEAF-base current challenge anchor | 567 | 0.5520 | 0.4995 |
+| Previous overlay anchor | 567 | 0.5551 | 0.5020 |
+| Mem0-inspired `llm_fact_v2` hybrid + shared support | 567 | 0.5641 | 0.5091 |
+
+Per-corpus F1/BLEU1:
+
+| Corpus | LEAF-base | Mem0-inspired |
+| --- | ---: | ---: |
+| conv-30 | 0.5711 / 0.5158 | 0.5886 / 0.5311 |
+| conv-43 | 0.5988 / 0.5423 | 0.6059 / 0.5473 |
+| conv-47 | 0.5315 / 0.4847 | 0.5487 / 0.4990 |
+| conv-50 | 0.5088 / 0.4569 | 0.5189 / 0.4643 |
+
+Per-category F1/BLEU1:
+
+| Category | LEAF-base | Mem0-inspired |
+| --- | ---: | ---: |
+| multi_hop | 0.3784 / 0.2874 | 0.4043 / 0.3146 |
+| open_domain | 0.2582 / 0.2294 | 0.2712 / 0.2392 |
+| single_hop | 0.5992 / 0.5505 | 0.6169 / 0.5648 |
+| temporal | 0.6465 / 0.6075 | 0.6319 / 0.5903 |
+
+Caveats:
+
+- The improvement is broad across all four corpora and non-temporal categories, but temporal questions regressed.
+- `llm_fact_v2` rows for conv-30 and conv-43 include smoke/retry leftovers; future clean runs should either use a fresh DB or add window-level source/run cleanup to avoid semantically near-duplicate facts.
+- A temporal runtime-skip ablation was started and stopped early because conv43 degraded sharply in the first 107 questions; partial output is `reports/agentic_memory/locomo4_mem0v2_temporalskip_llmfact_hybrid_sharedsupport_evolved_profileauto_fullsubset_20260518.json` and should not be used as a final result.
+- Directly adding `llm_fact_v1` sidecar facts into the answer context on conv-30 underperformed the hybrid-only path: `reports/agentic_memory/locomo4_mem0style_llmfact_directsupport2_sharedsupport_evolved_profileauto_conv30_20260518.json` gave F1 `0.5712`, BLEU1 `0.5135`, versus the prior conv-30 hybrid/shared support result F1 `0.5819`, BLEU1 `0.5271`.

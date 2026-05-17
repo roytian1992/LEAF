@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .records import (
+    AdditiveMemoryRecord,
     MemoryAtomRecord,
     MemoryEventRecord,
     MemoryEvidenceLinkRecord,
@@ -64,6 +65,23 @@ class SQLiteMemoryStore:
               time_range text,
               confidence real not null,
               metadata_json text not null default '{}'
+            );
+            create table if not exists leaf_additive_memories (
+              memory_id text primary key,
+              corpus_id text not null,
+              event_id text not null,
+              text text not null,
+              attributed_to text not null,
+              timestamp text,
+              linked_atom_ids_json text not null default '[]',
+              linked_memory_ids_json text not null default '[]',
+              entities_json text not null default '[]',
+              canonical_entities_json text not null default '[]',
+              terms_json text not null default '[]',
+              metadata_json text not null default '{}',
+              embedding_json text,
+              hash text,
+              created_at text
             );
             create table if not exists leaf_objects (
               object_id text primary key,
@@ -215,6 +233,8 @@ class SQLiteMemoryStore:
             create index if not exists idx_leaf_events_corpus_session on leaf_events(corpus_id, session_id, turn_index);
             create index if not exists idx_leaf_events_corpus_entity on leaf_events(corpus_id, session_id);
             create index if not exists idx_leaf_atoms_event on leaf_atoms(event_id);
+            create index if not exists idx_leaf_additive_memories_corpus on leaf_additive_memories(corpus_id, event_id);
+            create index if not exists idx_leaf_additive_memories_hash on leaf_additive_memories(corpus_id, hash);
             create index if not exists idx_leaf_objects_subject_slot on leaf_objects(corpus_id, subject, slot);
             create index if not exists idx_leaf_versions_object on leaf_object_versions(object_id, status);
             create index if not exists idx_leaf_links_object on leaf_evidence_links(object_id, event_id);
@@ -288,6 +308,35 @@ class SQLiteMemoryStore:
                 json.dumps(atom.metadata, ensure_ascii=False),
             ),
         )
+
+    def upsert_additive_memory(self, memory: AdditiveMemoryRecord) -> None:
+        self.conn.execute(
+            """
+            insert or replace into leaf_additive_memories
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                memory.memory_id,
+                memory.corpus_id,
+                memory.event_id,
+                memory.text,
+                memory.attributed_to,
+                memory.timestamp,
+                json.dumps(memory.linked_atom_ids, ensure_ascii=False),
+                json.dumps(memory.linked_memory_ids, ensure_ascii=False),
+                json.dumps(memory.entities, ensure_ascii=False),
+                json.dumps(memory.canonical_entities, ensure_ascii=False),
+                json.dumps(memory.terms, ensure_ascii=False),
+                json.dumps(memory.metadata, ensure_ascii=False),
+                json.dumps(memory.embedding, ensure_ascii=False) if memory.embedding is not None else None,
+                memory.hash,
+                memory.created_at,
+            ),
+        )
+
+    def upsert_additive_memories(self, memories: list[AdditiveMemoryRecord]) -> None:
+        for memory in memories:
+            self.upsert_additive_memory(memory)
 
     def upsert_object(self, obj: MemoryObjectRecord) -> None:
         self.conn.execute(
@@ -814,6 +863,36 @@ class SQLiteMemoryStore:
         rows = self.conn.execute(query, tuple(params)).fetchall()
         return [self._row_to_atom(row) for row in rows]
 
+    def list_additive_memories(self, corpus_id: str, limit: int | None = None) -> list[AdditiveMemoryRecord]:
+        query = """
+            select *
+            from leaf_additive_memories
+            where corpus_id = ?
+            order by timestamp, event_id, memory_id
+        """
+        params: list[object] = [corpus_id]
+        if limit is not None:
+            query += " limit ?"
+            params.append(int(limit))
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [self._row_to_additive_memory(row) for row in rows]
+
+    def get_additive_memories_for_events(self, event_ids: list[str]) -> list[AdditiveMemoryRecord]:
+        normalized_ids = [str(event_id).strip() for event_id in event_ids if str(event_id).strip()]
+        if not normalized_ids:
+            return []
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        rows = self.conn.execute(
+            f"""
+            select *
+            from leaf_additive_memories
+            where event_id in ({placeholders})
+            order by timestamp, event_id, memory_id
+            """,
+            tuple(normalized_ids),
+        ).fetchall()
+        return [self._row_to_additive_memory(row) for row in rows]
+
     def list_recent_atoms(self, corpus_id: str, limit: int = 80) -> list[MemoryAtomRecord]:
         rows = self.conn.execute(
             """
@@ -1238,6 +1317,26 @@ class SQLiteMemoryStore:
             time_range=row["time_range"],
             confidence=float(row["confidence"]),
             metadata=dict(_json_loads(row["metadata_json"], {})),
+        )
+
+    @staticmethod
+    def _row_to_additive_memory(row: sqlite3.Row) -> AdditiveMemoryRecord:
+        return AdditiveMemoryRecord(
+            memory_id=str(row["memory_id"]),
+            corpus_id=str(row["corpus_id"]),
+            event_id=str(row["event_id"]),
+            text=str(row["text"]),
+            attributed_to=str(row["attributed_to"]),
+            timestamp=row["timestamp"],
+            linked_atom_ids=list(_json_loads(row["linked_atom_ids_json"], [])),
+            linked_memory_ids=list(_json_loads(row["linked_memory_ids_json"], [])),
+            entities=list(_json_loads(row["entities_json"], [])),
+            canonical_entities=list(_json_loads(row["canonical_entities_json"], [])),
+            terms=list(_json_loads(row["terms_json"], [])),
+            metadata=dict(_json_loads(row["metadata_json"], {})),
+            embedding=list(_json_loads(row["embedding_json"], [])) if row["embedding_json"] else None,
+            hash=row["hash"],
+            created_at=row["created_at"],
         )
 
     @staticmethod
