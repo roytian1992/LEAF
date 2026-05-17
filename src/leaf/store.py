@@ -126,6 +126,92 @@ class SQLiteMemoryStore:
               metadata_json text not null default '{}',
               embedding_json text
             );
+            create table if not exists leaf_memory_views (
+              view_id text primary key,
+              corpus_id text not null,
+              parent_view_id text,
+              name text not null,
+              status text not null default 'candidate',
+              active integer not null default 0,
+              created_at text not null,
+              promoted_at text,
+              metadata_json text not null default '{}',
+              metrics_json text not null default '{}'
+            );
+            create table if not exists leaf_topic_nodes (
+              topic_id text primary key,
+              view_id text not null,
+              parent_id text,
+              name text not null,
+              description text not null,
+              level integer not null default 0,
+              keywords_json text not null default '[]',
+              exemplar_ids_json text not null default '[]',
+              stats_json text not null default '{}',
+              embedding_json text,
+              metadata_json text not null default '{}'
+            );
+            create table if not exists leaf_topic_assignments (
+              assignment_id text primary key,
+              view_id text not null,
+              corpus_id text not null,
+              item_kind text not null,
+              item_id text not null,
+              topic_id text not null,
+              confidence real not null default 0.0,
+              reason_json text not null default '{}'
+            );
+            create table if not exists leaf_topic_edges (
+              edge_id text primary key,
+              view_id text not null,
+              src_topic_id text not null,
+              dst_topic_id text not null,
+              edge_type text not null,
+              evidence_ids_json text not null default '[]',
+              confidence real not null default 0.0,
+              metadata_json text not null default '{}'
+            );
+            create table if not exists leaf_retrieval_policies (
+              policy_id text primary key,
+              view_id text not null,
+              scope_kind text not null,
+              scope_id text not null,
+              policy_json text not null default '{}',
+              metrics_json text not null default '{}'
+            );
+            create table if not exists leaf_evolution_runs (
+              run_id text primary key,
+              corpus_id text not null,
+              base_view_id text,
+              candidate_view_id text,
+              trigger_json text not null default '{}',
+              status text not null,
+              result_json text not null default '{}',
+              created_at text not null,
+              completed_at text
+            );
+            create table if not exists leaf_search_traces (
+              trace_id text primary key,
+              corpus_id text not null,
+              view_id text,
+              question text not null,
+              query_schema_json text not null default '{}',
+              retrieved_ids_json text not null default '[]',
+              metrics_json text not null default '{}',
+              created_at text not null
+            );
+            create table if not exists leaf_selfqa_tasks (
+              task_id text primary key,
+              corpus_id text not null,
+              view_id text,
+              question text not null,
+              answer text not null,
+              gold_evidence_path_json text not null default '[]',
+              tags_json text not null default '[]',
+              status text not null default 'candidate',
+              metadata_json text not null default '{}',
+              created_at text not null
+            );
             create index if not exists idx_leaf_events_corpus_session on leaf_events(corpus_id, session_id, turn_index);
             create index if not exists idx_leaf_events_corpus_entity on leaf_events(corpus_id, session_id);
             create index if not exists idx_leaf_atoms_event on leaf_atoms(event_id);
@@ -134,6 +220,14 @@ class SQLiteMemoryStore:
             create index if not exists idx_leaf_links_object on leaf_evidence_links(object_id, event_id);
             create index if not exists idx_leaf_links_event on leaf_evidence_links(corpus_id, event_id);
             create index if not exists idx_leaf_snapshots_kind on leaf_snapshots(corpus_id, snapshot_kind, scope_id);
+            create index if not exists idx_leaf_memory_views_corpus on leaf_memory_views(corpus_id, active, status);
+            create index if not exists idx_leaf_topic_nodes_view on leaf_topic_nodes(view_id, parent_id);
+            create unique index if not exists idx_leaf_topic_assignments_item on leaf_topic_assignments(view_id, item_kind, item_id);
+            create index if not exists idx_leaf_topic_assignments_topic on leaf_topic_assignments(view_id, topic_id);
+            create index if not exists idx_leaf_topic_edges_view on leaf_topic_edges(view_id, src_topic_id, dst_topic_id);
+            create index if not exists idx_leaf_retrieval_policies_scope on leaf_retrieval_policies(view_id, scope_kind, scope_id);
+            create index if not exists idx_leaf_search_traces_corpus on leaf_search_traces(corpus_id, view_id, created_at);
+            create index if not exists idx_leaf_selfqa_tasks_view on leaf_selfqa_tasks(corpus_id, view_id, status);
             """
         )
         self.conn.commit()
@@ -298,6 +392,316 @@ class SQLiteMemoryStore:
             ),
         )
 
+    def upsert_memory_view(
+        self,
+        *,
+        view_id: str,
+        corpus_id: str,
+        name: str,
+        parent_view_id: str | None = None,
+        status: str = "candidate",
+        active: bool = False,
+        created_at: str,
+        promoted_at: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        metrics: dict[str, Any] | None = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            insert or replace into leaf_memory_views
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                view_id,
+                corpus_id,
+                parent_view_id,
+                name,
+                status,
+                1 if active else 0,
+                created_at,
+                promoted_at,
+                json.dumps(metadata or {}, ensure_ascii=False),
+                json.dumps(metrics or {}, ensure_ascii=False),
+            ),
+        )
+
+    def promote_memory_view(self, view_id: str, *, promoted_at: str) -> None:
+        row = self.conn.execute(
+            "select corpus_id from leaf_memory_views where view_id = ?",
+            (view_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown memory view: {view_id}")
+        corpus_id = str(row["corpus_id"])
+        self.conn.execute(
+            "update leaf_memory_views set active = 0 where corpus_id = ?",
+            (corpus_id,),
+        )
+        self.conn.execute(
+            """
+            update leaf_memory_views
+            set active = 1, status = 'active', promoted_at = ?
+            where view_id = ?
+            """,
+            (promoted_at, view_id),
+        )
+
+    def update_memory_view_metrics(
+        self,
+        view_id: str,
+        *,
+        metrics: dict[str, Any],
+        status: str | None = None,
+    ) -> None:
+        if status is None:
+            self.conn.execute(
+                "update leaf_memory_views set metrics_json = ? where view_id = ?",
+                (json.dumps(metrics or {}, ensure_ascii=False), view_id),
+            )
+            return
+        self.conn.execute(
+            "update leaf_memory_views set status = ?, metrics_json = ? where view_id = ?",
+            (status, json.dumps(metrics or {}, ensure_ascii=False), view_id),
+        )
+
+    def update_memory_view_metadata(
+        self,
+        view_id: str,
+        *,
+        metadata: dict[str, Any],
+        status: str | None = None,
+    ) -> None:
+        if status is None:
+            self.conn.execute(
+                "update leaf_memory_views set metadata_json = ? where view_id = ?",
+                (json.dumps(metadata or {}, ensure_ascii=False), view_id),
+            )
+            return
+        self.conn.execute(
+            "update leaf_memory_views set status = ?, metadata_json = ? where view_id = ?",
+            (status, json.dumps(metadata or {}, ensure_ascii=False), view_id),
+        )
+
+    def get_memory_view(self, view_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "select * from leaf_memory_views where view_id = ?",
+            (view_id,),
+        ).fetchone()
+        return self._row_to_memory_view(row) if row else None
+
+    def get_active_memory_view(self, corpus_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            select *
+            from leaf_memory_views
+            where corpus_id = ? and active = 1
+            order by promoted_at desc, created_at desc
+            limit 1
+            """,
+            (corpus_id,),
+        ).fetchone()
+        return self._row_to_memory_view(row) if row else None
+
+    def list_memory_views(self, corpus_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            select *
+            from leaf_memory_views
+            where corpus_id = ?
+            order by created_at, view_id
+            """,
+            (corpus_id,),
+        ).fetchall()
+        return [self._row_to_memory_view(row) for row in rows]
+
+    def upsert_topic_node(
+        self,
+        *,
+        topic_id: str,
+        view_id: str,
+        name: str,
+        description: str,
+        parent_id: str | None = None,
+        level: int = 0,
+        keywords: list[str] | None = None,
+        exemplar_ids: list[str] | None = None,
+        stats: dict[str, Any] | None = None,
+        embedding: list[float] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            insert or replace into leaf_topic_nodes
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                topic_id,
+                view_id,
+                parent_id,
+                name,
+                description,
+                int(level),
+                json.dumps(keywords or [], ensure_ascii=False),
+                json.dumps(exemplar_ids or [], ensure_ascii=False),
+                json.dumps(stats or {}, ensure_ascii=False),
+                json.dumps(embedding, ensure_ascii=False) if embedding is not None else None,
+                json.dumps(metadata or {}, ensure_ascii=False),
+            ),
+        )
+
+    def list_topic_nodes(self, view_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            select *
+            from leaf_topic_nodes
+            where view_id = ?
+            order by level, parent_id, name, topic_id
+            """,
+            (view_id,),
+        ).fetchall()
+        return [self._row_to_topic_node(row) for row in rows]
+
+    def upsert_topic_assignment(
+        self,
+        *,
+        assignment_id: str,
+        view_id: str,
+        corpus_id: str,
+        item_kind: str,
+        item_id: str,
+        topic_id: str,
+        confidence: float,
+        reason: dict[str, Any] | None = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            insert or replace into leaf_topic_assignments
+            values (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                assignment_id,
+                view_id,
+                corpus_id,
+                item_kind,
+                item_id,
+                topic_id,
+                float(confidence),
+                json.dumps(reason or {}, ensure_ascii=False),
+            ),
+        )
+
+    def list_topic_assignments(
+        self,
+        view_id: str,
+        *,
+        item_kind: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "select * from leaf_topic_assignments where view_id = ?"
+        params: list[object] = [view_id]
+        if item_kind is not None:
+            query += " and item_kind = ?"
+            params.append(item_kind)
+        query += " order by topic_id, item_id"
+        if limit is not None:
+            query += " limit ?"
+            params.append(int(limit))
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [self._row_to_topic_assignment(row) for row in rows]
+
+    def add_search_trace(
+        self,
+        *,
+        trace_id: str,
+        corpus_id: str,
+        view_id: str | None,
+        question: str,
+        query_schema: dict[str, Any] | None = None,
+        retrieved_ids: list[str] | None = None,
+        metrics: dict[str, Any] | None = None,
+        created_at: str,
+    ) -> None:
+        self.conn.execute(
+            """
+            insert or replace into leaf_search_traces
+            values (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                trace_id,
+                corpus_id,
+                view_id,
+                question,
+                json.dumps(query_schema or {}, ensure_ascii=False),
+                json.dumps(retrieved_ids or [], ensure_ascii=False),
+                json.dumps(metrics or {}, ensure_ascii=False),
+                created_at,
+            ),
+        )
+
+    def add_evolution_run(
+        self,
+        *,
+        run_id: str,
+        corpus_id: str,
+        base_view_id: str | None = None,
+        candidate_view_id: str | None = None,
+        trigger: dict[str, Any] | None = None,
+        status: str,
+        result: dict[str, Any] | None = None,
+        created_at: str,
+        completed_at: str | None = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            insert or replace into leaf_evolution_runs
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                corpus_id,
+                base_view_id,
+                candidate_view_id,
+                json.dumps(trigger or {}, ensure_ascii=False),
+                status,
+                json.dumps(result or {}, ensure_ascii=False),
+                created_at,
+                completed_at,
+            ),
+        )
+
+    def add_selfqa_task(
+        self,
+        *,
+        task_id: str,
+        corpus_id: str,
+        view_id: str | None,
+        question: str,
+        answer: str,
+        gold_evidence_path: list[dict[str, Any]],
+        tags: list[str],
+        status: str,
+        metadata: dict[str, Any] | None,
+        created_at: str,
+    ) -> None:
+        self.conn.execute(
+            """
+            insert or replace into leaf_selfqa_tasks
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                corpus_id,
+                view_id,
+                question,
+                answer,
+                json.dumps(gold_evidence_path or [], ensure_ascii=False),
+                json.dumps(tags or [], ensure_ascii=False),
+                status,
+                json.dumps(metadata or {}, ensure_ascii=False),
+                created_at,
+            ),
+        )
+
     def get_next_turn_index(self, corpus_id: str, session_id: str) -> int:
         row = self.conn.execute(
             """
@@ -379,6 +783,52 @@ class SQLiteMemoryStore:
             tuple(normalized_ids),
         ).fetchall()
         return [self._row_to_atom(row) for row in rows]
+
+    def get_atoms_by_ids(self, atom_ids: list[str]) -> list[MemoryAtomRecord]:
+        normalized_ids = list(dict.fromkeys(str(atom_id).strip() for atom_id in atom_ids if str(atom_id).strip()))
+        if not normalized_ids:
+            return []
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        rows = self.conn.execute(
+            f"""
+            select *
+            from leaf_atoms
+            where atom_id in ({placeholders})
+            order by event_id, atom_id
+            """,
+            tuple(normalized_ids),
+        ).fetchall()
+        return [self._row_to_atom(row) for row in rows]
+
+    def list_atoms(self, corpus_id: str, limit: int | None = None) -> list[MemoryAtomRecord]:
+        query = """
+            select *
+            from leaf_atoms
+            where corpus_id = ?
+            order by event_id, atom_id
+        """
+        params: list[object] = [corpus_id]
+        if limit is not None:
+            query += " limit ?"
+            params.append(int(limit))
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [self._row_to_atom(row) for row in rows]
+
+    def list_recent_atoms(self, corpus_id: str, limit: int = 80) -> list[MemoryAtomRecord]:
+        rows = self.conn.execute(
+            """
+            select a.*
+            from leaf_atoms a
+            join leaf_events e on e.event_id = a.event_id
+            where a.corpus_id = ?
+            order by e.session_id desc, e.turn_index desc, a.atom_id desc
+            limit ?
+            """,
+            (corpus_id, max(1, int(limit))),
+        ).fetchall()
+        atoms = [self._row_to_atom(row) for row in rows]
+        atoms.reverse()
+        return atoms
 
     def get_snapshot(self, corpus_id: str, snapshot_kind: str, scope_id: str) -> MemorySnapshotRecord | None:
         row = self.conn.execute(
@@ -689,6 +1139,17 @@ class SQLiteMemoryStore:
             "versions": scalar("select count(*) from leaf_object_versions where corpus_id = ?", corpus_id),
             "evidence_links": scalar("select count(*) from leaf_evidence_links where corpus_id = ?", corpus_id),
             "snapshots": scalar("select count(*) from leaf_snapshots where corpus_id = ?", corpus_id),
+            "memory_views": scalar("select count(*) from leaf_memory_views where corpus_id = ?", corpus_id),
+            "topic_nodes": scalar(
+                """
+                select count(*)
+                from leaf_topic_nodes n
+                join leaf_memory_views v on v.view_id = n.view_id
+                where v.corpus_id = ?
+                """,
+                corpus_id,
+            ),
+            "topic_assignments": scalar("select count(*) from leaf_topic_assignments where corpus_id = ?", corpus_id),
             "sessions": scalar("select count(distinct session_id) from leaf_events where corpus_id = ?", corpus_id),
             "subjects": scalar("select count(distinct subject) from leaf_objects where corpus_id = ?", corpus_id),
             "snapshot_counts_by_kind": snapshot_counts_by_kind,
@@ -714,6 +1175,50 @@ class SQLiteMemoryStore:
             metadata=dict(_json_loads(row["metadata_json"], {})),
             embedding=list(_json_loads(row["embedding_json"], [])) if row["embedding_json"] else None,
         )
+
+    @staticmethod
+    def _row_to_memory_view(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "view_id": str(row["view_id"]),
+            "corpus_id": str(row["corpus_id"]),
+            "parent_view_id": row["parent_view_id"],
+            "name": str(row["name"]),
+            "status": str(row["status"]),
+            "active": bool(row["active"]),
+            "created_at": str(row["created_at"]),
+            "promoted_at": row["promoted_at"],
+            "metadata": dict(_json_loads(row["metadata_json"], {})),
+            "metrics": dict(_json_loads(row["metrics_json"], {})),
+        }
+
+    @staticmethod
+    def _row_to_topic_node(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "topic_id": str(row["topic_id"]),
+            "view_id": str(row["view_id"]),
+            "parent_id": row["parent_id"],
+            "name": str(row["name"]),
+            "description": str(row["description"]),
+            "level": int(row["level"]),
+            "keywords": list(_json_loads(row["keywords_json"], [])),
+            "exemplar_ids": list(_json_loads(row["exemplar_ids_json"], [])),
+            "stats": dict(_json_loads(row["stats_json"], {})),
+            "embedding": list(_json_loads(row["embedding_json"], [])) if row["embedding_json"] else None,
+            "metadata": dict(_json_loads(row["metadata_json"], {})),
+        }
+
+    @staticmethod
+    def _row_to_topic_assignment(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "assignment_id": str(row["assignment_id"]),
+            "view_id": str(row["view_id"]),
+            "corpus_id": str(row["corpus_id"]),
+            "item_kind": str(row["item_kind"]),
+            "item_id": str(row["item_id"]),
+            "topic_id": str(row["topic_id"]),
+            "confidence": float(row["confidence"]),
+            "reason": dict(_json_loads(row["reason_json"], {})),
+        }
 
     @staticmethod
     def _row_to_atom(row: sqlite3.Row) -> MemoryAtomRecord:

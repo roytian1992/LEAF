@@ -697,7 +697,10 @@ class AtomExtractor:
                 status=infer_atom_status(text),
                 time_range=span.timestamp,
                 confidence=0.4,
-                metadata={"speaker": span.speaker, "temporal_grounding": temporal_grounding, "semantic_refs": semantic_refs},
+                metadata=self._span_atom_metadata(
+                    span,
+                    {"temporal_grounding": temporal_grounding, "semantic_refs": semantic_refs},
+                ),
             )
         ]
         caption = str(span.metadata.get("blip_caption") or "").strip()
@@ -717,12 +720,14 @@ class AtomExtractor:
                     status="active",
                     time_range=span.timestamp,
                     confidence=0.45,
-                    metadata={
-                        "speaker": span.speaker,
+                    metadata=self._span_atom_metadata(
+                        span,
+                        {
                         "source": "blip_caption",
                         "temporal_grounding": temporal_grounding,
                         "semantic_refs": caption_refs,
-                    },
+                        },
+                    ),
                 )
             )
         lowered = text.lower()
@@ -745,17 +750,36 @@ class AtomExtractor:
         cached_atoms = self._load_cached_llm_atoms(span=span, cache_key=cache_key)
         if cached_atoms is not None:
             return cached_atoms
+        topic_hints = dict(span.metadata.get("active_topic_hints") or {})
+        topic_hint_lines = []
+        for hint in topic_hints.get("hints") or []:
+            slug = str(hint.get("slug") or "").strip()
+            name = str(hint.get("name") or "").strip()
+            keywords = ", ".join(str(keyword) for keyword in (hint.get("keywords") or [])[:8])
+            if slug or name:
+                topic_hint_lines.append(f"- {slug or name}: {name or slug}; keywords={keywords}")
+        topic_hint_text = "\n".join(topic_hint_lines[:5])
         messages = [
             {
                 "role": "system",
                 "content": (
                     "Extract up to 5 memory atoms from a single interaction span. "
-                    "Return JSON with key 'atoms'. Each atom must contain type, content, entities, confidence."
+                    "Return JSON with key 'atoms'. Each atom must contain type, content, entities, confidence. "
+                    "When active memory topics are provided, use them only as schema hints for what details "
+                    "are worth preserving; do not invent facts or copy topic names as facts."
                 ),
             },
             {
                 "role": "user",
-                "content": f"speaker={span.speaker}\ntext={span.text}",
+                "content": "\n".join(
+                    part
+                    for part in [
+                        f"speaker={span.speaker}",
+                        f"active_memory_topics:\n{topic_hint_text}" if topic_hint_text else "",
+                        f"text={span.text}",
+                    ]
+                    if part
+                ),
             },
         ]
         prompt_tokens = estimate_message_tokens(messages)
@@ -795,6 +819,13 @@ class AtomExtractor:
         metadata = {"speaker": span.speaker}
         if extra_metadata:
             metadata.update(extra_metadata)
+        for key in ("source", "source_speakers", "merged_turn_count", "merged_turn_indexes"):
+            value = span.metadata.get(key)
+            if value:
+                metadata[key] = value
+        topic_hints = span.metadata.get("active_topic_hints")
+        if topic_hints:
+            metadata["active_topic_hints"] = topic_hints
         return MemoryAtom(
             atom_id=stable_id("atom", span.span_id, atom_type, content),
             corpus_id=span.corpus_id,
@@ -810,6 +841,20 @@ class AtomExtractor:
             confidence=confidence,
             metadata=metadata,
         )
+
+    @staticmethod
+    def _span_atom_metadata(span: RawSpan, extra_metadata: dict[str, object] | None = None) -> dict[str, object]:
+        metadata: dict[str, object] = {"speaker": span.speaker}
+        if extra_metadata:
+            metadata.update(extra_metadata)
+        for key in ("source", "source_speakers", "merged_turn_count", "merged_turn_indexes"):
+            value = span.metadata.get(key)
+            if value:
+                metadata[key] = value
+        topic_hints = span.metadata.get("active_topic_hints")
+        if topic_hints:
+            metadata["active_topic_hints"] = topic_hints
+        return metadata
 
     def _record_prompt_tokens(self, *, prompt_tokens: int, from_provider_usage: bool) -> None:
         with self._runtime_metrics_lock:
@@ -845,6 +890,8 @@ class AtomExtractor:
         model_name = str(getattr(getattr(self.llm, "config", None), "model_name", "") or "")
         base_url = str(getattr(getattr(self.llm, "config", None), "base_url", "") or "")
         prompt_revision = "atom_prompt_v1"
+        topic_hints = span.metadata.get("active_topic_hints") or {}
+        topic_hint_fingerprint = json.dumps(topic_hints, sort_keys=True, ensure_ascii=False)
         digest = hashlib.sha1(
             "||".join(
                 [
@@ -854,6 +901,7 @@ class AtomExtractor:
                     base_url,
                     str(span.speaker or ""),
                     str(span.text or ""),
+                    topic_hint_fingerprint,
                 ]
             ).encode("utf-8")
         ).hexdigest()

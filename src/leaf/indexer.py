@@ -229,11 +229,13 @@ class LEAFIndexer:
         atom_extractor: AtomExtractor,
         embedding_client: EmbeddingClient | None = None,
         reconciliation_llm: ChatClient | None = None,
+        topic_hint_provider: Any | None = None,
     ):
         self.store = store
         self.atom_extractor = atom_extractor
         self.embedding_client = embedding_client
         self.reconciliation_llm = reconciliation_llm
+        self.topic_hint_provider = topic_hint_provider
         self._reconcile_cache_dir = self._resolve_reconcile_cache_dir()
 
     def append_turns(
@@ -251,6 +253,8 @@ class LEAFIndexer:
         touched_subjects: set[str] = set()
         events_written = 0
         atoms_written = 0
+        written_atom_ids: list[str] = []
+        written_event_ids: list[str] = []
         objects_written = 0
         evidence_links_written = 0
         state_candidates = 0
@@ -307,6 +311,8 @@ class LEAFIndexer:
                 )
                 events_written += 1
                 atoms_written += len(atoms)
+                written_event_ids.append(event.event_id)
+                written_atom_ids.extend(atom.atom_id for atom in atoms)
                 objects_written += touched_object_count
                 evidence_links_written += int(turn_metrics["evidence_links_written"])
                 state_candidates += int(turn_metrics["state_candidates"])
@@ -354,6 +360,8 @@ class LEAFIndexer:
             "snapshot_refresh_skipped": not refresh_snapshots,
             "events_written": events_written,
             "atoms_written": atoms_written,
+            "written_event_ids": written_event_ids,
+            "written_atom_ids": written_atom_ids,
             "objects_written": objects_written,
             "evidence_links_written": evidence_links_written,
             "state_candidates": state_candidates,
@@ -751,6 +759,13 @@ class LEAFIndexer:
             "merged_turn_indexes": [int(item["event"].turn_index) for item in chunk],
             "semantic_refs": semantic_refs,
         }
+        if self.topic_hint_provider is not None:
+            try:
+                topic_hints = self.topic_hint_provider(anchor_event.corpus_id, merged_text)
+            except Exception:
+                topic_hints = None
+            if topic_hints:
+                metadata["active_topic_hints"] = topic_hints
         if overlap_sentence:
             metadata["overlap_sentence"] = overlap_sentence
         return RawSpan(

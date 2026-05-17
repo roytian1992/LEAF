@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 import time
 from collections import defaultdict
@@ -18,6 +19,7 @@ from .grounding import (
     split_text_fragments,
 )
 from .store import SQLiteMemoryStore
+from .agentic_memory import tokenize as tokenize_topic_text, topic_slug
 
 ALNUM_PATTERN = re.compile(r"[a-z0-9]+")
 
@@ -147,18 +149,113 @@ LIST_QUERY_PATTERNS = (
     "which topics",
     "what books",
     "which books",
+    "what gifts",
+    "which gifts",
+    "what items",
+    "which items",
+    "what things",
+    "which things",
+    "what activities",
+    "which activities",
+    "what hobbies",
+    "which hobbies",
+    "what songs",
+    "which songs",
+    "what artists",
+    "which artists",
+    "what movies",
+    "which movies",
+    "what games",
+    "which games",
+    "what foods",
+    "which foods",
+    "what dishes",
+    "which dishes",
+    "what recommendations",
+    "which recommendations",
+    "what events",
+    "which events",
+    "what plans",
+    "which plans",
+    "what goals",
+    "which goals",
+    "what classes",
+    "which classes",
+    "what workshops",
+    "which workshops",
     "what suggestions",
     "what tips",
     "what places",
+    "which places",
     "what painters",
+    "which painters",
     "what bands",
+    "which bands",
     "what projects",
+    "which projects",
     "what sports",
+    "which sports",
     "what outdoor sports",
     "what problems",
+    "which problems",
     "what issues",
+    "which issues",
     "what are some",
     "what were they",
+)
+
+LIST_COLLECTION_NOUNS = (
+    "activities",
+    "artists",
+    "bands",
+    "books",
+    "classes",
+    "dishes",
+    "events",
+    "foods",
+    "games",
+    "gifts",
+    "goals",
+    "hobbies",
+    "items",
+    "movies",
+    "painters",
+    "places",
+    "plans",
+    "problems",
+    "projects",
+    "recommendations",
+    "songs",
+    "sports",
+    "suggestions",
+    "things",
+    "tips",
+    "topics",
+    "workshops",
+)
+
+LIST_COLLECTION_VERBS = (
+    "achieved",
+    "bought",
+    "created",
+    "did",
+    "done",
+    "gave",
+    "given",
+    "got",
+    "learned",
+    "made",
+    "planned",
+    "played",
+    "read",
+    "received",
+    "recommended",
+    "shared",
+    "suggested",
+    "tried",
+    "visited",
+    "watched",
+    "won",
 )
 LIST_QUERY_PATTERNS_ZH = (
     "哪些",
@@ -262,6 +359,8 @@ LEXICAL_EDGE_STRONG_IDF = 2.8
 LEXICAL_EDGE_SCORE_THRESHOLD = 0.2
 LEXICAL_EDGE_SEED_LIMIT = 12
 LEXICAL_EDGE_TOKEN_LIMIT = 6
+TOPIC_RERANK_ENABLED = str(os.environ.get("LEAF_TOPIC_RERANK", "")).strip().lower() in {"1", "true", "yes", "on"}
+TOPIC_RERANK_MAX_BONUS = float(os.environ.get("LEAF_TOPIC_RERANK_MAX_BONUS", "0.16") or "0.16")
 
 GENERIC_EDGE_TOKENS = {
     "amazing",
@@ -674,7 +773,19 @@ def is_list_query(question: str) -> bool:
     if language_mode == "zh":
         text = str(question or "").strip()
         return any(pattern in text for pattern in LIST_QUERY_PATTERNS_ZH)
-    return any(pattern in lowered for pattern in LIST_QUERY_PATTERNS)
+    if any(pattern in lowered for pattern in LIST_QUERY_PATTERNS):
+        return True
+    if re.search(r"\bwhat\s+(?:does|do)\s+.+\s+do\s+with\b", lowered):
+        return True
+    collection_noun_re = "|".join(re.escape(noun) for noun in LIST_COLLECTION_NOUNS)
+    collection_verb_re = "|".join(re.escape(verb) for verb in LIST_COLLECTION_VERBS)
+    return bool(
+        re.search(rf"\b(?:what|which)\s+(?:all\s+)?(?:{collection_noun_re})\b", lowered)
+        or re.search(
+            rf"\bwhat\s+(?:has|have|had|did|does|do)\s+.+\b(?:{collection_verb_re})\b",
+            lowered,
+        )
+    )
 
 
 def is_single_fact_query(question: str) -> bool:
@@ -805,6 +916,7 @@ def retrieve_leaf_memory(
     snapshot_limit: int = 6,
     raw_span_limit: int = 8,
     corpus_cache: dict[str, Any] | None = None,
+    local_support_mode: str = "off",
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
     stage_timings_ms: dict[str, float] = {}
@@ -876,6 +988,11 @@ def retrieve_leaf_memory(
     normalized_query_terms = cached_query_terms(lexical_query_text)
     lowered_question = str(question or "").strip().lower()
     list_query = is_list_query(question)
+    yes_no_query = bool(lowered_question) and (
+        lowered_question.startswith(YES_NO_PREFIXES)
+        or lowered_question.endswith("right?")
+        or ", right?" in lowered_question
+    )
     query_entities = _ordered_unique_strings(
         [item.lower() for item in cached_extract_entities(question)]
         + [item.lower() for item in cached_extract_semantic_refs(question)]
@@ -939,6 +1056,15 @@ def retrieve_leaf_memory(
     event_date_key_cache: dict[str, str | None] = {}
     event_raw_spans_cache: dict[str, list[dict[str, Any]]] = {}
     snapshot_score_cache: dict[str, float] = {}
+    topic_bonus_by_event: dict[str, float] = {}
+    topic_rerank_diagnostics: dict[str, Any] = {
+        "enabled": bool(TOPIC_RERANK_ENABLED),
+        "view_id": None,
+        "matched_topic_count": 0,
+        "matched_topics": [],
+        "event_bonus_count": 0,
+        "max_bonus": 0.0,
+    }
 
     def score_embedding(vector: list[float] | None) -> float:
         if not vector:
@@ -976,6 +1102,95 @@ def retrieve_leaf_memory(
         if not speaker_text or not query_entities:
             return 0.0
         return 0.22 if speaker_text in query_entities else 0.0
+
+    def build_topic_bonus_by_event(*, speaker_tokens: set[str]) -> dict[str, float]:
+        if not TOPIC_RERANK_ENABLED:
+            return {}
+        active_view = store.get_active_memory_view(corpus_id)
+        if active_view is None:
+            return {}
+        view_id = str(active_view["view_id"])
+        topic_rerank_diagnostics["view_id"] = view_id
+        query_terms = set(normalized_query_terms)
+        query_terms.update(tokenize_topic_text(question))
+        query_terms = {term for term in query_terms if term not in speaker_tokens}
+        if not query_terms:
+            return {}
+        nodes = store.list_topic_nodes(view_id)
+        node_by_id = {str(node["topic_id"]): node for node in nodes}
+        matched_topics: dict[str, dict[str, Any]] = {}
+        for node in nodes:
+            metadata = dict(node.get("metadata") or {})
+            if metadata.get("seed_role") == "root":
+                continue
+            keywords = [str(item).strip() for item in (node.get("keywords") or []) if str(item).strip()]
+            route_keywords = [
+                str(item).strip()
+                for item in (metadata.get("route_keywords") or [])
+                if str(item).strip()
+            ]
+            profile_terms = [
+                str(item).strip()
+                for item in (metadata.get("profile_terms") or [])
+                if str(item).strip()
+            ]
+            topic_terms = tokenize_topic_text(
+                " ".join(
+                    [
+                        str(node.get("name") or ""),
+                        " ".join(route_keywords),
+                        " ".join(profile_terms),
+                        " ".join(keywords),
+                    ]
+                )
+            )
+            topic_terms = {term for term in topic_terms if term not in speaker_tokens}
+            matched = sorted(query_terms.intersection(topic_terms))
+            if not matched:
+                continue
+            role = "evolved" if (metadata.get("evolved_slug") or metadata.get("evolution_source")) else "seed"
+            base_bonus = 0.07 if role == "evolved" else 0.04
+            match_bonus = min(0.06, 0.02 * len(matched))
+            if metadata.get("primary_assignment_exposure") == "inactive":
+                base_bonus *= 0.75
+            matched_topics[str(node["topic_id"])] = {
+                "slug": topic_slug(node),
+                "role": role,
+                "matched_terms": matched[:6],
+                "bonus": round(base_bonus + match_bonus, 4),
+            }
+        topic_rerank_diagnostics["matched_topic_count"] = len(matched_topics)
+        topic_rerank_diagnostics["matched_topics"] = list(matched_topics.values())[:8]
+        if not matched_topics:
+            return {}
+        atom_ids_by_topic: dict[str, list[str]] = defaultdict(list)
+        atom_ids: set[str] = set()
+        for assignment in store.list_topic_assignments(view_id):
+            topic_id = str(assignment.get("topic_id") or "")
+            if topic_id not in matched_topics:
+                continue
+            atom_id = str(assignment.get("item_id") or "").strip()
+            if not atom_id:
+                continue
+            atom_ids_by_topic[topic_id].append(atom_id)
+            atom_ids.add(atom_id)
+        atom_event_by_id = {atom.atom_id: atom.event_id for atom in store.get_atoms_by_ids(sorted(atom_ids))}
+        bonus_by_event: dict[str, float] = defaultdict(float)
+        for topic_id, topic_atom_ids in atom_ids_by_topic.items():
+            topic_bonus = float(matched_topics[topic_id]["bonus"])
+            for atom_id in topic_atom_ids:
+                event_id = atom_event_by_id.get(atom_id)
+                if not event_id:
+                    continue
+                bonus_by_event[str(event_id)] += topic_bonus
+        capped = {
+            event_id: min(float(TOPIC_RERANK_MAX_BONUS), bonus)
+            for event_id, bonus in bonus_by_event.items()
+            if bonus > 0
+        }
+        topic_rerank_diagnostics["event_bonus_count"] = len(capped)
+        topic_rerank_diagnostics["max_bonus"] = round(max(capped.values(), default=0.0), 4)
+        return capped
 
     def cached_event_support_text(event: Any) -> str:
         event_id = str(event.event_id)
@@ -1312,6 +1527,16 @@ def retrieve_leaf_memory(
     all_events = list((corpus_cache or {}).get("all_events") or store.get_events(corpus_id=corpus_id))
     stage_timings_ms["event_load"] = round((time.perf_counter() - event_load_started_at) * 1000.0, 2)
 
+    speaker_tokens = {
+        token
+        for event in all_events
+        for token in tokenize_topic_text(str(event.speaker or ""))
+        if token
+    }
+    topic_rerank_started_at = time.perf_counter()
+    topic_bonus_by_event = build_topic_bonus_by_event(speaker_tokens=speaker_tokens)
+    stage_timings_ms["topic_rerank_prepare"] = round((time.perf_counter() - topic_rerank_started_at) * 1000.0, 2)
+
     event_lookup = dict((corpus_cache or {}).get("event_lookup") or {event.event_id: event for event in all_events})
     entity_event_ids = dict((corpus_cache or {}).get("entity_event_ids") or {})
     session_turn_lookup: dict[str, dict[int, Any]] = dict((corpus_cache or {}).get("session_turn_lookup") or {})
@@ -1407,6 +1632,7 @@ def retrieve_leaf_memory(
             score += 0.18
         if prefer_inference_support and event.canonical_entity_refs:
             score += 0.05
+        score += float(topic_bonus_by_event.get(event.event_id, 0.0))
         event_base_scores[event.event_id] = score
         scored_events.append((score, event))
     stage_timings_ms["event_feature_scoring"] = round((time.perf_counter() - event_feature_scoring_started_at) * 1000.0, 2)
@@ -1711,6 +1937,7 @@ def retrieve_leaf_memory(
             score = (
                 float(event_base_scores.get(event.event_id, 0.0))
                 + float(candidate_bonus_by_event.get(event.event_id, 0.0))
+                + float(topic_bonus_by_event.get(event.event_id, 0.0)) * 0.35
             )
             matched_entities = cached_matched_query_entities(event)
             if require_entity_coverage:
@@ -1755,6 +1982,7 @@ def retrieve_leaf_memory(
 
     raw_span_pack_started_at = time.perf_counter()
     raw_spans: list[dict[str, Any]] = []
+    supporting_raw_spans: list[dict[str, Any]] = []
     seen_span_ids: set[str] = set()
 
     def append_raw_span(event: Any) -> None:
@@ -1763,6 +1991,22 @@ def retrieve_leaf_memory(
         if not span_id or span_id in seen_span_ids:
             return
         raw_spans.append(span)
+        seen_span_ids.add(span_id)
+
+    def append_supporting_raw_span(event: Any, *, seed_event: Any, delta: int) -> None:
+        span = event_to_primary_raw_span(event)
+        span_id = str(span.get("span_id") or "").strip()
+        if not span_id or span_id in seen_span_ids:
+            return
+        metadata = dict(span.get("metadata") or {})
+        metadata["local_support"] = {
+            "seed_event_id": str(seed_event.event_id),
+            "seed_session_id": str(seed_event.session_id),
+            "seed_turn_index": int(seed_event.turn_index),
+            "delta": int(delta),
+        }
+        span["metadata"] = metadata
+        supporting_raw_spans.append(span)
         seen_span_ids.add(span_id)
 
     for event in selected_events:
@@ -1774,6 +2018,127 @@ def retrieve_leaf_memory(
             append_raw_span(event)
             if len(raw_spans) >= raw_span_limit:
                 break
+
+    local_support_started_at = time.perf_counter()
+    requested_local_support_mode = str(local_support_mode or "off").strip().lower()
+    if requested_local_support_mode not in {"off", "selective"}:
+        requested_local_support_mode = "off"
+    support_neighbor_limit = 0
+    support_radius = 0
+    local_support_policy = "off"
+    if requested_local_support_mode == "off" or is_temporal_query(question):
+        support_neighbor_limit = 0
+        support_radius = 0
+    elif list_query or require_entity_coverage:
+        support_neighbor_limit = 10
+        support_radius = 4
+        local_support_policy = "broad"
+    elif yes_no_query:
+        support_neighbor_limit = 8
+        support_radius = 2
+        local_support_policy = "dialog"
+    elif re.search(r"\bmoved?\s+from\b", lowered_question):
+        support_neighbor_limit = 6
+        support_radius = 2
+        local_support_policy = "bridge"
+    elif re.search(r"\bafter\b", lowered_question):
+        support_neighbor_limit = 6
+        support_radius = 2
+        local_support_policy = "bridge"
+    elif prefer_inference_support:
+        support_neighbor_limit = 4
+        support_radius = 2
+        local_support_policy = "inference"
+    if support_neighbor_limit > 0 and support_radius > 0:
+        support_candidates: list[tuple[float, int, int, Any, Any]] = []
+        for seed_index, seed_event in enumerate(selected_events):
+            session_events = session_turn_lookup.get(str(seed_event.session_id), {})
+            seed_text = str(seed_event.text or "")
+            seed_tokens = cached_event_tokens(seed_event)
+            seed_is_question = "?" in seed_text
+            seed_anchor_style = cached_anchor_style(seed_event)
+            for delta in range(-support_radius, support_radius + 1):
+                if delta == 0:
+                    continue
+                neighbor = session_events.get(int(seed_event.turn_index) + delta)
+                if neighbor is None:
+                    continue
+                neighbor_text = str(neighbor.text or "")
+                neighbor_tokens = cached_event_tokens(neighbor)
+                prev_neighbor = session_events.get(int(neighbor.turn_index) - 1)
+                next_neighbor = session_events.get(int(neighbor.turn_index) + 1)
+                neighbor_is_dialog_answer = bool(
+                    prev_neighbor is not None
+                    and "?" in str(prev_neighbor.text or "")
+                    and str(prev_neighbor.speaker or "") != str(neighbor.speaker or "")
+                )
+                neighbor_is_dialog_question = bool(
+                    "?" in neighbor_text
+                    and next_neighbor is not None
+                    and str(next_neighbor.speaker or "") != str(neighbor.speaker or "")
+                )
+                query_overlap = normalized_query_terms.intersection(neighbor_tokens)
+                seed_overlap = seed_tokens.intersection(neighbor_tokens)
+                entity_overlap = cached_matched_query_entities(neighbor)
+                support_ref_overlap = {
+                    ref
+                    for ref in cached_event_support_refs(neighbor)
+                    if ref in normalized_query_terms or ref in recall_terms
+                }
+                should_add = False
+                if local_support_policy in {"broad", "dialog"} and abs(delta) == 1 and (
+                    seed_is_question or neighbor_is_dialog_answer or neighbor_is_dialog_question
+                ):
+                    should_add = True
+                if query_overlap or entity_overlap or support_ref_overlap:
+                    should_add = True
+                if local_support_policy in {"broad", "dialog", "bridge"} and seed_anchor_style and abs(delta) <= 2:
+                    should_add = True
+                if list_query and abs(delta) <= support_radius and (seed_overlap or neighbor_is_dialog_answer):
+                    should_add = True
+                if local_support_policy == "bridge" and abs(delta) == 1 and (seed_overlap or neighbor_is_dialog_answer):
+                    should_add = True
+                if not should_add:
+                    continue
+                support_score = 0.0
+                support_score += max(0.0, 0.45 - abs(delta) * 0.08)
+                support_score += min(0.45, len(query_overlap) * 0.09)
+                support_score += min(0.35, len(support_ref_overlap) * 0.08)
+                support_score += min(0.25, len(seed_overlap) * 0.03)
+                if entity_overlap:
+                    support_score += min(0.2, len(entity_overlap) * 0.08)
+                if neighbor_is_dialog_answer:
+                    support_score += 0.22
+                if neighbor_is_dialog_question:
+                    support_score += 0.12
+                if seed_anchor_style and abs(delta) <= 2:
+                    support_score += 0.12
+                if str(neighbor.speaker or "").strip().lower() in query_entities:
+                    support_score += 0.08
+                support_candidates.append(
+                    (
+                        support_score,
+                        seed_index,
+                        abs(delta),
+                        seed_event,
+                        neighbor,
+                    )
+                )
+        support_candidates.sort(key=lambda item: (-item[0], item[1], item[2], int(item[4].turn_index)))
+        support_count_by_seed: dict[str, int] = defaultdict(int)
+        max_support_per_seed = 3 if local_support_policy == "broad" else 2
+        for support_score, _, _, seed_event, neighbor in support_candidates:
+            seed_id = str(seed_event.event_id)
+            if support_count_by_seed[seed_id] >= max_support_per_seed:
+                continue
+            delta = int(neighbor.turn_index) - int(seed_event.turn_index)
+            before_count = len(supporting_raw_spans)
+            append_supporting_raw_span(neighbor, seed_event=seed_event, delta=delta)
+            if len(supporting_raw_spans) > before_count:
+                support_count_by_seed[seed_id] += 1
+            if len(supporting_raw_spans) >= support_neighbor_limit:
+                break
+    stage_timings_ms["local_support_pack"] = round((time.perf_counter() - local_support_started_at) * 1000.0, 2)
     stage_timings_ms["raw_span_pack"] = round((time.perf_counter() - raw_span_pack_started_at) * 1000.0, 2)
 
     atom_materialization_started_at = time.perf_counter()
@@ -1881,6 +2246,7 @@ def retrieve_leaf_memory(
         "atoms": atoms,
         "edges": [],
         "raw_spans": raw_spans,
+        "supporting_raw_spans": supporting_raw_spans,
         "selected_event_ids": [event.event_id for event in selected_events],
         "selected_session_ids": _ordered_unique_strings([str(event.session_id) for event in selected_events]),
         "timing": {
@@ -1892,10 +2258,14 @@ def retrieve_leaf_memory(
                 "use_light_neighbor_expansion": USE_LIGHT_NEIGHBOR_EXPANSION,
                 "use_lexical_edge_expansion": USE_LEXICAL_EDGE_EXPANSION,
                 "use_session_local_completion": USE_SESSION_LOCAL_COMPLETION,
+                "use_topic_rerank": TOPIC_RERANK_ENABLED,
+                "local_support_mode": requested_local_support_mode,
+                "local_support_policy": local_support_policy,
                 "enable_neighbor_expansion": enable_neighbor_expansion,
                 "enable_lexical_edge_expansion": enable_lexical_edge_expansion,
                 "enable_speaker_session_mining": enable_speaker_session_mining,
                 "enable_event_atom_rerank": enable_event_atom_rerank,
             },
+            "topic_rerank": topic_rerank_diagnostics,
         },
     }

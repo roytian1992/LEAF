@@ -76,6 +76,12 @@ class ChatClient:
             "temperature": overrides.get("temperature", self.config.temperature),
             "max_tokens": overrides.get("max_tokens", self.config.max_tokens),
         }
+        top_p = overrides.get("top_p", self.config.top_p)
+        if top_p is not None:
+            payload["top_p"] = top_p
+        seed = overrides.get("seed", self.config.seed)
+        if seed is not None:
+            payload["seed"] = seed
         if "response_format" in overrides:
             payload["response_format"] = overrides["response_format"]
         return _post_json(
@@ -145,7 +151,9 @@ def extract_chat_text(response: dict[str, Any]) -> str:
         raise OpenAICompatError(f"Unexpected chat response: {response}") from exc
 
 
-def extract_prompt_tokens(response: dict[str, Any]) -> int | None:
+def extract_prompt_tokens(response: Any) -> int | None:
+    if not isinstance(response, dict):
+        return None
     usage = response.get("usage")
     if not isinstance(usage, dict):
         return None

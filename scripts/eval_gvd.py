@@ -8,6 +8,7 @@ import re
 import statistics
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from leaf.clients import ChatClient, OpenAICompatError
 from leaf.grounding import is_inference_query, is_temporal_query, query_tokens as make_query_tokens
 from leaf.normalize import contains_cjk, language_aware_terms, normalize_surface_text, strip_edge_punctuation
 from leaf.service import LEAFService
+from leaf.topic_soft import apply_topic_soft_policy, build_topic_context, merge_topic_soft_evidence, route_topics, topic_soft_expand_events
 
 try:
     import regex as unicode_re
@@ -2042,6 +2044,100 @@ def parse_args() -> argparse.Namespace:
         default="none",
         help="Optional second-pass recovery when the first answer is UNKNOWN despite a strong direct clue.",
     )
+    parser.add_argument(
+        "--retrieval-mode",
+        choices=["baseline", "topic_soft", "topic_soft_gated", "topic_soft_selective"],
+        default="baseline",
+        help="Controls retrieval-side experimental variants. baseline preserves the original path.",
+    )
+    parser.add_argument("--topic-view-id", default="", help="Topic view for topic_soft. Defaults to active view per corpus.")
+    parser.add_argument(
+        "--topic-router",
+        choices=["keyword", "profile_hybrid", "profile_quality", "evolved_profile_first", "overlay_facet_hybrid", "llm"],
+        default="keyword",
+    )
+    parser.add_argument("--topic-route-top-k", type=int, default=3)
+    parser.add_argument("--topic-soft-event-limit", type=int, default=4)
+    parser.add_argument("--topic-soft-per-topic-atom-limit", type=int, default=16)
+    parser.add_argument(
+        "--topic-soft-min-content-overlap",
+        type=int,
+        default=1,
+        help="For topic_soft_gated, require each added topic atom to overlap this many non-stopword question tokens.",
+    )
+    parser.add_argument(
+        "--topic-soft-allow-fallback-topic",
+        action="store_true",
+        help="For topic_soft_gated, allow fallback/misc routes to add evidence.",
+    )
+    parser.add_argument(
+        "--topic-soft-secondary-policy",
+        choices=["all", "primary_only", "strict_text_v0"],
+        default="all",
+        help="Controls how atom_secondary assignments from evolved topics may add retrieval evidence.",
+    )
+    parser.add_argument(
+        "--topic-soft-secondary-min-content-overlap",
+        type=int,
+        default=2,
+        help="For strict_text_v0, require secondary atoms to overlap this many non-stopword question tokens.",
+    )
+    parser.add_argument(
+        "--topic-soft-secondary-min-route-keyword-overlap",
+        type=int,
+        default=1,
+        help="For strict_text_v0, require secondary-only topic routes to overlap this many question content tokens.",
+    )
+    parser.add_argument(
+        "--topic-soft-min-event-embedding-similarity",
+        type=float,
+        default=0.0,
+        help="When >0, topic-soft events must pass question-event embedding similarity.",
+    )
+    parser.add_argument(
+        "--topic-soft-use-stemmed-content-tokens",
+        action="store_true",
+        help="Use English stemming in topic-soft content-token overlap and atom scoring.",
+    )
+    parser.add_argument(
+        "--topic-soft-fallback",
+        choices=["none", "baseline_on_unknown"],
+        default="none",
+        help="Retry answer synthesis on baseline evidence when topic_soft evidence yields UNKNOWN.",
+    )
+    parser.add_argument(
+        "--topic-soft-policy-min-selected-overlap",
+        type=int,
+        default=2,
+        help="For topic_soft_selective, require the selected topic event to overlap this many content tokens.",
+    )
+    parser.add_argument(
+        "--topic-soft-policy-max-candidate-atoms",
+        type=int,
+        default=20,
+        help="For topic_soft_selective, suppress topic evidence when the filtered candidate atom pool is larger.",
+    )
+    parser.add_argument(
+        "--topic-soft-policy",
+        choices=[
+            "selected_overlap_and_candidate_count_v0",
+            "text_temporal_suppressed_v0",
+            "route_uncertainty_semantic_v0",
+        ],
+        default="selected_overlap_and_candidate_count_v0",
+        help="For topic_soft_selective, choose the runtime-visible policy used before merging topic evidence.",
+    )
+    parser.add_argument(
+        "--topic-soft-policy-min-selected-semantic-similarity",
+        type=float,
+        default=0.0,
+        help="For route_uncertainty_semantic_v0, suppress topic evidence below this selected event similarity.",
+    )
+    parser.add_argument(
+        "--topic-soft-policy-suppress-multi-route",
+        action="store_true",
+        help="For route_uncertainty_semantic_v0, suppress topic evidence when multiple routes are active.",
+    )
     return parser.parse_args()
 
 
@@ -2099,6 +2195,11 @@ def main() -> None:
             if args.question_limit > 0:
                 persona_questions = persona_questions[: args.question_limit]
 
+            topic_context = (
+                build_topic_context(service.store, corpus_id, args.topic_view_id or None)
+                if args.retrieval_mode in {"topic_soft", "topic_soft_gated", "topic_soft_selective"}
+                else None
+            )
             for question_index, question in enumerate(persona_questions, start=1):
                 search_started = time.perf_counter()
                 evidence = service.search(
@@ -2107,6 +2208,98 @@ def main() -> None:
                     snapshot_limit=args.snapshot_limit,
                     raw_span_limit=args.raw_span_limit,
                 )
+                baseline_evidence = evidence
+                topic_soft_payload = None
+                if args.retrieval_mode in {"topic_soft", "topic_soft_gated", "topic_soft_selective"} and topic_context is not None:
+                    baseline_event_ids = {
+                        str(event_id).strip()
+                        for event_id in (evidence.get("selected_event_ids") or [])
+                        if str(event_id).strip()
+                    }
+                    topic_query_embedding = None
+                    try:
+                        semantic_gate_min_similarity = float(args.topic_soft_min_event_embedding_similarity or 0.0)
+                        needs_query_embedding = (
+                            args.topic_router in {
+                                "profile_hybrid",
+                                "profile_quality",
+                                "evolved_profile_first",
+                                "overlay_facet_hybrid",
+                            }
+                            or semantic_gate_min_similarity > 0.0
+                        )
+                        route_query_embedding = None
+                        if needs_query_embedding and getattr(service, "embedding", None) is not None:
+                            route_query_embedding = service.embedding.embed(question)
+                            topic_query_embedding = route_query_embedding
+                        routed_topics, routed_router = route_topics(
+                            service.store,
+                            topic_context,
+                            question=question,
+                            router=args.topic_router,
+                            top_k=args.topic_route_top_k,
+                            llm=service.memory_llm if args.topic_router == "llm" else None,
+                            query_embedding=route_query_embedding,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        routed_topics, routed_router = route_topics(
+                            service.store,
+                            topic_context,
+                            question=question,
+                            router="keyword",
+                            top_k=args.topic_route_top_k,
+                            llm=None,
+                            query_embedding=None,
+                        )
+                        for route in routed_topics:
+                            route["router_error"] = str(exc)[:300]
+                    topic_soft_payload = topic_soft_expand_events(
+                        service.store,
+                        topic_context,
+                        question=question,
+                        routed_topics=routed_topics,
+                        exclude_event_ids=baseline_event_ids,
+                        event_limit=args.topic_soft_event_limit,
+                        per_topic_atom_limit=args.topic_soft_per_topic_atom_limit,
+                        min_content_overlap=(
+                            max(0, int(args.topic_soft_min_content_overlap))
+                            if args.retrieval_mode in {"topic_soft_gated", "topic_soft_selective"}
+                            else 0
+                        ),
+                        allow_fallback_topic=(
+                            bool(args.topic_soft_allow_fallback_topic)
+                            if args.retrieval_mode in {"topic_soft_gated", "topic_soft_selective"}
+                            else True
+                        ),
+                        score_with_content_tokens=args.retrieval_mode in {"topic_soft_gated", "topic_soft_selective"},
+                        secondary_policy=args.topic_soft_secondary_policy,
+                        secondary_min_content_overlap=max(0, int(args.topic_soft_secondary_min_content_overlap)),
+                        secondary_min_route_keyword_overlap=max(
+                            0,
+                            int(args.topic_soft_secondary_min_route_keyword_overlap),
+                        ),
+                        query_embedding=topic_query_embedding,
+                        min_event_embedding_similarity=max(
+                            0.0,
+                            float(args.topic_soft_min_event_embedding_similarity or 0.0),
+                        ),
+                        use_stemmed_content_tokens=bool(args.topic_soft_use_stemmed_content_tokens),
+                    )
+                    topic_soft_payload["router"] = routed_router
+                    if args.retrieval_mode == "topic_soft_selective":
+                        topic_soft_payload = apply_topic_soft_policy(
+                            topic_soft_payload,
+                            policy=args.topic_soft_policy,
+                            min_selected_overlap=max(0, int(args.topic_soft_policy_min_selected_overlap)),
+                            max_candidate_atom_count=max(0, int(args.topic_soft_policy_max_candidate_atoms)),
+                            suppress_for_temporal_query=is_temporal_query(question),
+                            min_selected_semantic_similarity=max(
+                                0.0,
+                                float(args.topic_soft_policy_min_selected_semantic_similarity or 0.0),
+                            ),
+                            suppress_multi_route=bool(args.topic_soft_policy_suppress_multi_route),
+                        )
+                    evidence = merge_topic_soft_evidence(evidence, topic_soft_payload)
                 search_elapsed_ms = (time.perf_counter() - search_started) * 1000.0
 
                 context_lines = build_answer_context_lines(evidence)
@@ -2140,6 +2333,7 @@ def main() -> None:
                 answer_started = time.perf_counter()
                 unknown_recovery_triggered = False
                 unknown_recovery_used = False
+                topic_soft_fallback_used = False
                 deterministic_answer_used = False
                 answer_llm_call_count = 0
                 try:
@@ -2206,6 +2400,64 @@ def main() -> None:
                         answer_llm_call_count += 1
                         if revised_answer:
                             predicted_answer = revised_answer
+                    if (
+                        args.retrieval_mode in {"topic_soft", "topic_soft_gated", "topic_soft_selective"}
+                        and args.topic_soft_fallback == "baseline_on_unknown"
+                        and bool((topic_soft_payload or {}).get("event_ids"))
+                        and baseline_evidence is not evidence
+                        and predicted_answer
+                        and str(predicted_answer).strip().upper() == "UNKNOWN"
+                    ):
+                        baseline_context_lines = build_answer_context_lines(baseline_evidence)
+                        baseline_answer_view = build_compact_answer_view(
+                            question=question,
+                            evidence=baseline_evidence,
+                            mode=args.answer_view_mode,
+                            language_mode=language_mode,
+                        )
+                        if args.answer_view_mode == "heuristic":
+                            baseline_answer_view = reshape_heuristic_answer_view_for_gvd(
+                                question,
+                                answer_view=baseline_answer_view,
+                                context_lines=baseline_context_lines,
+                            )
+                        baseline_answer_view_text = render_answer_view_text(
+                            question=question,
+                            answer_view=baseline_answer_view,
+                            language_mode=language_mode,
+                        )
+                        baseline_answer_messages = build_answer_messages(
+                            question=question,
+                            evidence=baseline_evidence,
+                            answer_style=args.answer_style,
+                            context_lines=baseline_context_lines,
+                            answer_view_text=baseline_answer_view_text,
+                            answer_view=baseline_answer_view,
+                            language_mode=language_mode,
+                        )
+                        answer_input_tokens_est += estimate_message_tokens(baseline_answer_messages)
+                        fallback_answer = extract_structured_answer_from_context(
+                            question,
+                            answer_view=baseline_answer_view,
+                            context_lines=baseline_context_lines,
+                            language_mode=language_mode,
+                        )
+                        fallback_deterministic_used = bool(fallback_answer)
+                        if not fallback_answer and service.llm:
+                            fallback_answer = service.llm.text(
+                                baseline_answer_messages,
+                                max_tokens=answer_max_tokens,
+                                temperature=0.0,
+                            ).strip()
+                            answer_llm_call_count += 1
+                        if (
+                            fallback_answer
+                            and not fallback_answer.startswith("__ERROR__:")
+                            and str(fallback_answer).strip().upper() != "UNKNOWN"
+                        ):
+                            predicted_answer = fallback_answer
+                            topic_soft_fallback_used = True
+                            deterministic_answer_used = deterministic_answer_used or fallback_deterministic_used
                 except OpenAICompatError as exc:
                     predicted_answer = f"__ERROR__: {exc}"
                 answer_elapsed_ms = (time.perf_counter() - answer_started) * 1000.0
@@ -2252,6 +2504,78 @@ def main() -> None:
                         "deterministic_answer_used": deterministic_answer_used,
                         "answer_llm_call_count": answer_llm_call_count,
                         "raw_span_count": len(evidence.get("raw_spans") or []),
+                        "topic_soft_event_count": len((topic_soft_payload or {}).get("event_ids") or []),
+                        "topic_soft_atom_count": len((topic_soft_payload or {}).get("atom_ids") or []),
+                        "topic_soft_candidate_atom_count": int((topic_soft_payload or {}).get("candidate_atom_count") or 0),
+                        "topic_soft_raw_candidate_atom_count": int((topic_soft_payload or {}).get("raw_candidate_atom_count") or 0),
+                        "topic_soft_filtered_atom_count": int((topic_soft_payload or {}).get("filtered_atom_count") or 0),
+                        "topic_soft_skipped_low_overlap_count": int((topic_soft_payload or {}).get("skipped_low_overlap_count") or 0),
+                        "topic_soft_skipped_fallback_route_count": int((topic_soft_payload or {}).get("skipped_fallback_route_count") or 0),
+                        "topic_soft_secondary_policy": (topic_soft_payload or {}).get("secondary_policy"),
+                        "topic_soft_secondary_candidate_atom_count": int(
+                            (topic_soft_payload or {}).get("secondary_candidate_atom_count") or 0
+                        ),
+                        "topic_soft_secondary_selected_atom_count": int(
+                            (topic_soft_payload or {}).get("secondary_selected_atom_count") or 0
+                        ),
+                        "topic_soft_skipped_secondary_route_count": int(
+                            (topic_soft_payload or {}).get("skipped_secondary_route_count") or 0
+                        ),
+                        "topic_soft_skipped_secondary_policy_count": int(
+                            (topic_soft_payload or {}).get("skipped_secondary_policy_count") or 0
+                        ),
+                        "topic_soft_skipped_secondary_low_overlap_count": int(
+                            (topic_soft_payload or {}).get("skipped_secondary_low_overlap_count") or 0
+                        ),
+                        "topic_soft_semantic_gate_enabled": bool(
+                            (topic_soft_payload or {}).get("semantic_gate_enabled")
+                        ),
+                        "topic_soft_semantic_gate_min_similarity": (
+                            (topic_soft_payload or {}).get("semantic_gate_min_similarity")
+                        ),
+                        "topic_soft_semantic_gate_max_similarity": (
+                            (topic_soft_payload or {}).get("semantic_gate_max_similarity")
+                        ),
+                        "topic_soft_semantic_gate_skipped_event_count": int(
+                            (topic_soft_payload or {}).get("semantic_gate_skipped_event_count") or 0
+                        ),
+                        "topic_soft_semantic_gate_missing_embedding_count": int(
+                            (topic_soft_payload or {}).get("semantic_gate_missing_embedding_count") or 0
+                        ),
+                        "topic_soft_active_route_count": len((topic_soft_payload or {}).get("active_routes") or []),
+                        "topic_soft_router": (topic_soft_payload or {}).get("router"),
+                        "topic_soft_topic_slugs": [
+                            str(route.get("slug") or route.get("topic_id"))
+                            for route in ((topic_soft_payload or {}).get("routes") or [])
+                        ],
+                        "topic_soft_active_topic_slugs": [
+                            str(route.get("slug") or route.get("topic_id"))
+                            for route in ((topic_soft_payload or {}).get("active_routes") or [])
+                        ],
+                        "topic_soft_fallback": args.topic_soft_fallback,
+                        "topic_soft_fallback_used": topic_soft_fallback_used,
+                        "topic_soft_policy": (topic_soft_payload or {}).get("policy"),
+                        "topic_soft_policy_applied": bool((topic_soft_payload or {}).get("policy_applied")),
+                        "topic_soft_policy_reason": (topic_soft_payload or {}).get("policy_reason"),
+                        "topic_soft_policy_max_selected_content_overlap": int(
+                            (topic_soft_payload or {}).get("policy_max_selected_content_overlap") or 0
+                        ),
+                        "topic_soft_policy_max_selected_semantic_similarity": (
+                            (topic_soft_payload or {}).get("policy_max_selected_semantic_similarity")
+                        ),
+                        "topic_soft_policy_min_selected_semantic_similarity": (
+                            (topic_soft_payload or {}).get("policy_min_selected_semantic_similarity")
+                        ),
+                        "topic_soft_policy_suppress_multi_route": bool(
+                            (topic_soft_payload or {}).get("policy_suppress_multi_route")
+                        ),
+                        "topic_soft_policy_min_selected_overlap": int(
+                            (topic_soft_payload or {}).get("policy_min_selected_overlap") or 0
+                        ),
+                        "topic_soft_policy_max_candidate_atom_count": int(
+                            (topic_soft_payload or {}).get("policy_max_candidate_atom_count") or 0
+                        ),
+                        "topic_soft_suppressed_event_count": len((topic_soft_payload or {}).get("suppressed_event_ids") or []),
                         "answer_context_line_count": len(context_lines),
                         "answer_view_summary": summarize_answer_view(answer_view),
                         "answer_view_text_chars": len(answer_view_text),
@@ -2268,6 +2592,11 @@ def main() -> None:
         token_values = [row["answer_input_tokens_est"] for row in results]
         elapsed_values = [row["elapsed_ms"] for row in results]
         judge_values = [row["judge_score"] for row in results if row["judge_score"] is not None]
+        topic_soft_event_values = [int(row.get("topic_soft_event_count") or 0) for row in results]
+        topic_soft_candidate_values = [int(row.get("topic_soft_candidate_atom_count") or 0) for row in results]
+        topic_soft_raw_candidate_values = [int(row.get("topic_soft_raw_candidate_atom_count") or 0) for row in results]
+        topic_soft_filtered_values = [int(row.get("topic_soft_filtered_atom_count") or 0) for row in results]
+        topic_soft_suppressed_values = [int(row.get("topic_soft_suppressed_event_count") or 0) for row in results]
         ingest_metric_rows = [
             dict(row["ingest_metrics"])
             for row in ingest_rows
@@ -2296,6 +2625,30 @@ def main() -> None:
             "unknown_recovery_mode": args.unknown_recovery,
             "unknown_recovery_triggered_count": sum(1 for row in results if row.get("unknown_recovery_triggered")),
             "unknown_recovery_used_count": sum(1 for row in results if row.get("unknown_recovery_used")),
+            "retrieval_mode": args.retrieval_mode,
+            "avg_topic_soft_event_count": round(sum(topic_soft_event_values) / len(topic_soft_event_values), 4) if topic_soft_event_values else 0.0,
+            "topic_soft_fallback": args.topic_soft_fallback,
+            "topic_soft_fallback_used_count": sum(1 for row in results if row.get("topic_soft_fallback_used")),
+            "avg_topic_soft_candidate_atom_count": (
+                round(sum(topic_soft_candidate_values) / len(topic_soft_candidate_values), 4)
+                if topic_soft_candidate_values
+                else 0.0
+            ),
+            "avg_topic_soft_raw_candidate_atom_count": (
+                round(sum(topic_soft_raw_candidate_values) / len(topic_soft_raw_candidate_values), 4)
+                if topic_soft_raw_candidate_values
+                else 0.0
+            ),
+            "avg_topic_soft_filtered_atom_count": (
+                round(sum(topic_soft_filtered_values) / len(topic_soft_filtered_values), 4)
+                if topic_soft_filtered_values
+                else 0.0
+            ),
+            "topic_soft_skipped_low_overlap_total": sum(int(row.get("topic_soft_skipped_low_overlap_count") or 0) for row in results),
+            "topic_soft_skipped_fallback_route_total": sum(int(row.get("topic_soft_skipped_fallback_route_count") or 0) for row in results),
+            "topic_soft_policy_applied_count": sum(1 for row in results if row.get("topic_soft_policy_applied")),
+            "topic_soft_suppressed_event_total": sum(topic_soft_suppressed_values),
+            "topic_soft_policy_reason_counts": dict(Counter(str(row.get("topic_soft_policy_reason") or "") for row in results)),
             "answer_llm_call_count_total": sum(int(row.get("answer_llm_call_count") or 0) for row in results),
             "ingest_reused_count": sum(1 for row in ingest_rows if row["reused"]),
             "ingest_new_count": sum(1 for row in ingest_rows if row["ingested"]),
@@ -2350,6 +2703,25 @@ def main() -> None:
             "answer_view_mode": args.answer_view_mode,
             "answer_revision": args.answer_revision,
             "unknown_recovery": args.unknown_recovery,
+            "retrieval_mode": args.retrieval_mode,
+            "topic_view_id": args.topic_view_id,
+            "topic_router": args.topic_router,
+            "topic_route_top_k": args.topic_route_top_k,
+            "topic_soft_event_limit": args.topic_soft_event_limit,
+            "topic_soft_per_topic_atom_limit": args.topic_soft_per_topic_atom_limit,
+            "topic_soft_min_content_overlap": args.topic_soft_min_content_overlap,
+            "topic_soft_allow_fallback_topic": args.topic_soft_allow_fallback_topic,
+            "topic_soft_secondary_policy": args.topic_soft_secondary_policy,
+            "topic_soft_secondary_min_content_overlap": args.topic_soft_secondary_min_content_overlap,
+            "topic_soft_secondary_min_route_keyword_overlap": args.topic_soft_secondary_min_route_keyword_overlap,
+            "topic_soft_min_event_embedding_similarity": args.topic_soft_min_event_embedding_similarity,
+            "topic_soft_use_stemmed_content_tokens": args.topic_soft_use_stemmed_content_tokens,
+            "topic_soft_fallback": args.topic_soft_fallback,
+            "topic_soft_policy": args.topic_soft_policy,
+            "topic_soft_policy_min_selected_overlap": args.topic_soft_policy_min_selected_overlap,
+            "topic_soft_policy_max_candidate_atoms": args.topic_soft_policy_max_candidate_atoms,
+            "topic_soft_policy_min_selected_semantic_similarity": args.topic_soft_policy_min_selected_semantic_similarity,
+            "topic_soft_policy_suppress_multi_route": args.topic_soft_policy_suppress_multi_route,
             "summary": summary,
             "ingest": ingest_rows,
             "results": results,

@@ -9,6 +9,7 @@ dist/
 data/
 reports/
 runs/
+logs/
 .cache/
 tmp/
 examples/config_local.yaml

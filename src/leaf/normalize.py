@@ -16,11 +16,21 @@ try:
 except ImportError:  # pragma: no cover - optional dependency fallback
     jieba = None
 
+try:
+    from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS as SKLEARN_ENGLISH_STOP_WORDS
+except ImportError:  # pragma: no cover - optional dependency fallback
+    SKLEARN_ENGLISH_STOP_WORDS = frozenset()
+
+try:
+    from nltk.stem.snowball import SnowballStemmer
+except ImportError:  # pragma: no cover - optional dependency fallback
+    SnowballStemmer = None  # type: ignore[assignment]
+
 
 STOPWORDS = {
     "the", "a", "an", "of", "in", "on", "for", "and", "or", "to", "by",
     "at", "from", "with", "without", "into", "over", "under", "after", "before",
-}
+} | set(SKLEARN_ENGLISH_STOP_WORDS)
 ZH_STOPWORDS = {
     "的", "了", "呢", "吗", "啊", "呀", "吧", "和", "与", "及", "或", "而", "被",
     "在", "对", "把", "将", "向", "给", "跟", "还", "又", "也", "都", "就", "很",
@@ -91,11 +101,11 @@ def language_aware_terms(
     if resolved_mode == "auto":
         resolved_mode = "zh" if contains_cjk(normalized) else "en"
     tokens: set[str] = set()
-    for token in _LATIN_TOKEN_RE.findall(normalized.lower()):
-        if len(token) > 1:
-            tokens.add(token)
     if resolved_mode == "zh":
-        if include_cjk_subgrams:
+        for token in _LATIN_TOKEN_RE.findall(normalized.lower()):
+            if len(token) > 1 and token not in STOPWORDS:
+                tokens.add(token)
+        if include_cjk_subgrams and jieba is None:
             for run in _CJK_RUN_RE.findall(normalized):
                 clean_run = strip_edge_punctuation(run)
                 if clean_run and len(clean_run) >= 2:
@@ -122,6 +132,67 @@ def language_aware_terms(
             if len(token) > 2 and token not in STOPWORDS:
                 tokens.add(token)
     return tuple(sorted(tokens))
+
+
+def language_aware_content_terms(
+    text: str,
+    *,
+    mode: str = "auto",
+    include_cjk_subgrams: bool = True,
+    max_cjk_ngram: int = 4,
+) -> tuple[str, ...]:
+    terms = language_aware_terms(
+        text,
+        mode=mode,
+        include_cjk_subgrams=include_cjk_subgrams,
+        max_cjk_ngram=max_cjk_ngram,
+    )
+    return tuple(
+        term
+        for term in terms
+        if term not in STOPWORDS and term not in ZH_STOPWORDS and len(term) >= 2
+    )
+
+
+@lru_cache(maxsize=1)
+def _english_stemmer() -> object | None:
+    if SnowballStemmer is None:
+        return None
+    return SnowballStemmer("english")
+
+
+@lru_cache(maxsize=32768)
+def language_aware_stemmed_content_terms(
+    text: str,
+    *,
+    mode: str = "auto",
+    include_cjk_subgrams: bool = True,
+    max_cjk_ngram: int = 4,
+) -> tuple[str, ...]:
+    terms = set(
+        language_aware_content_terms(
+            text,
+            mode=mode,
+            include_cjk_subgrams=include_cjk_subgrams,
+            max_cjk_ngram=max_cjk_ngram,
+        )
+    )
+    normalized = normalize_surface_text(text)
+    resolved_mode = str(mode or "auto").strip().lower()
+    if resolved_mode == "auto":
+        resolved_mode = "zh" if contains_cjk(normalized) else "en"
+    if resolved_mode != "en":
+        return tuple(sorted(terms))
+    stemmer = _english_stemmer()
+    if stemmer is None:
+        return tuple(sorted(terms))
+    for term in list(terms):
+        if not re.fullmatch(r"[a-z0-9]+", term):
+            continue
+        stem = str(stemmer.stem(term)).strip().lower()  # type: ignore[attr-defined]
+        if len(stem) >= 2 and stem not in STOPWORDS:
+            terms.add(stem)
+    return tuple(sorted(terms))
 
 
 @lru_cache(maxsize=32768)

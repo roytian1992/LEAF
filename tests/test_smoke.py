@@ -177,6 +177,7 @@ class LEAFSmokeTest(unittest.TestCase):
                     path=input_path,
                 )
                 self.assertEqual(ingest["events_written"], 8)
+                self.assertEqual(ingest["agentic_memory_assignment"]["reason"], "no_active_view")
                 self.assertIn("caroline", ingest["touched_subjects"])
 
                 corpora = service.list_corpora()
@@ -185,6 +186,119 @@ class LEAFSmokeTest(unittest.TestCase):
                 root = service.get_root_snapshot("demo")
                 self.assertIsNotNone(root)
                 self.assertEqual(root["snapshot_kind"], "root")
+
+                memory_view = service.bootstrap_agentic_memory_view(
+                    corpus_id="demo",
+                    activate=True,
+                    metadata={"test": "smoke"},
+                )
+                self.assertTrue(memory_view["active"])
+                self.assertEqual(memory_view["topic_nodes_written"], 11)
+                self.assertGreater(memory_view["assignment"]["assignments_written"], 0)
+                self.assertIn("work_education", memory_view["assignment"]["topic_counts"])
+                active_view = service.get_active_agentic_memory_view("demo")
+                self.assertIsNotNone(active_view)
+                self.assertEqual(active_view["view_id"], memory_view["view_id"])
+                existing_seed = service.ensure_seed_agentic_memory_view("demo")
+                self.assertFalse(existing_seed["created"])
+                self.assertEqual(existing_seed["view"]["view_id"], memory_view["view_id"])
+                topic_routes = service.route_query_topics(
+                    "demo",
+                    "What is Caroline planning to study for mental health work?",
+                    top_k=2,
+                )
+                self.assertIsNotNone(topic_routes)
+                self.assertIn(
+                    "work_education",
+                    [route["slug"] for route in topic_routes["routes"]],
+                )
+                incremental = service.append_turns(
+                    corpus_id="demo",
+                    title="Smoke Demo",
+                    turns=[
+                        {
+                            "session_id": "session-3",
+                            "speaker": "Caroline",
+                            "text": "I am revisiting psychology study plans for my mental health career.",
+                            "timestamp": "2025-03-02T19:00:00",
+                        }
+                    ],
+                )
+                self.assertTrue(incremental["agentic_memory_assignment"]["assigned"])
+                self.assertGreater(
+                    incremental["agentic_memory_assignment"]["assignments_written"],
+                    0,
+                )
+                self.assertIn(
+                    "work_education",
+                    incremental["agentic_memory_assignment"]["topic_counts"],
+                )
+                self.assertFalse(incremental["agentic_memory_evolution"]["triggered"])
+
+                hiking_growth = service.append_turns(
+                    corpus_id="demo",
+                    title="Smoke Demo",
+                    turns=[
+                        {
+                            "session_id": "session-4",
+                            "speaker": "Caroline",
+                            "text": "Trailbird planning keeps coming up in my weekend notes.",
+                            "timestamp": "2025-03-03T09:00:00",
+                        },
+                        {
+                            "session_id": "session-4",
+                            "speaker": "Caroline",
+                            "text": "Trailbird gear lists now include boots, snacks, and weather checks.",
+                            "timestamp": "2025-03-04T09:00:00",
+                        },
+                        {
+                            "session_id": "session-4",
+                            "speaker": "Caroline",
+                            "text": "Trailbird route planning helps me compare maps before hikes.",
+                            "timestamp": "2025-03-05T09:00:00",
+                        },
+                    ],
+                )
+                forced_growth = service.maybe_evolve_agentic_memory_after_ingest(
+                    corpus_id="demo",
+                    ingest_result=hiking_growth,
+                    force=True,
+                    min_cluster_atoms=2,
+                    max_new_topics=2,
+                    window_atom_limit=24,
+                )
+                self.assertTrue(forced_growth["triggered"])
+                self.assertEqual(forced_growth["status"], "promoted")
+                self.assertGreaterEqual(forced_growth["added_topic_count"], 1)
+                grown_tree = service.get_agentic_topic_tree("demo")
+                self.assertIsNotNone(grown_tree)
+
+                def slugs(nodes):
+                    result = []
+                    for node in nodes:
+                        result.append(node["slug"])
+                        result.extend(slugs(node.get("children") or []))
+                    return result
+
+                self.assertIn("trailbird", slugs(grown_tree["tree"]["roots"]))
+
+                hinted = service.append_turns(
+                    corpus_id="demo",
+                    title="Smoke Demo",
+                    turns=[
+                        {
+                            "session_id": "session-4",
+                            "speaker": "Caroline",
+                            "text": "Trailbird packing is easier when the boots are already by the door.",
+                            "timestamp": "2025-03-06T09:00:00",
+                        }
+                    ],
+                )
+                hinted_atoms = service.store.get_atoms_by_ids(hinted["written_atom_ids"])
+                self.assertTrue(
+                    any((atom.metadata or {}).get("active_topic_hints") for atom in hinted_atoms),
+                    msg=[atom.metadata for atom in hinted_atoms],
+                )
 
                 session = service.get_session_snapshot("demo", "session-1")
                 self.assertIsNotNone(session)
@@ -214,6 +328,46 @@ class LEAFSmokeTest(unittest.TestCase):
                     all(page["page_kind"] in allowed_page_kinds for page in retrieval["pages"]),
                     msg=f"Unexpected retrieval page kinds: {retrieval['pages']}",
                 )
+                traced_retrieval = service.search(
+                    corpus_id="demo",
+                    question="What is Caroline planning to study?",
+                    raw_span_limit=4,
+                    trace_memory=True,
+                )
+                current_active_view = service.get_active_agentic_memory_view("demo")
+                self.assertIsNotNone(current_active_view)
+                self.assertEqual(
+                    traced_retrieval["agentic_memory"]["active_view_id"],
+                    current_active_view["view_id"],
+                )
+                trace_count = service.store.conn.execute(
+                    "select count(*) from leaf_search_traces where corpus_id = ?",
+                    ("demo",),
+                ).fetchone()[0]
+                self.assertEqual(trace_count, 1)
+
+                service.store.update_memory_view_metrics(
+                    memory_view["view_id"],
+                    metrics={"promotion_gate": {"passed": True}},
+                )
+                service.store.add_evolution_run(
+                    run_id="evo_smoke",
+                    corpus_id="demo",
+                    candidate_view_id=memory_view["view_id"],
+                    status="passed",
+                    result={"gate": {"passed": True}},
+                    created_at="2026-05-15T00:00:00+00:00",
+                    completed_at="2026-05-15T00:00:00+00:00",
+                )
+                service.store.commit()
+                updated_view = service.store.get_memory_view(memory_view["view_id"])
+                self.assertIsNotNone(updated_view)
+                self.assertEqual(updated_view["metrics"]["promotion_gate"]["passed"], True)
+                evolution_count = service.store.conn.execute(
+                    "select count(*) from leaf_evolution_runs where corpus_id = ?",
+                    ("demo",),
+                ).fetchone()[0]
+                self.assertGreaterEqual(evolution_count, 1)
             finally:
                 service.close()
 

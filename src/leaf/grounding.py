@@ -118,11 +118,39 @@ TEMPORAL_PATTERN_SPECS = (
         "offset_days": 0,
     },
     {
+        "name": "about_year_ago",
+        "pattern": re.compile(r"\b(?:(?:about|around|roughly|approximately)\s+)?(?:a|one|1)\s+year\s+ago\b"),
+        "kind": "month_offset",
+        "precision": "month",
+        "offset_months": -12,
+    },
+    {
         "name": "last_year",
         "pattern": re.compile(r"\blast year\b"),
         "kind": "year_offset",
         "precision": "year",
         "offset_years": -1,
+    },
+    {
+        "name": "last_season",
+        "pattern": re.compile(r"\blast\s+(?P<season>spring|summer|fall|autumn|winter)\b"),
+        "kind": "season_offset",
+        "precision": "season",
+        "offset_years": -1,
+    },
+    {
+        "name": "this_season",
+        "pattern": re.compile(r"\bthis\s+(?P<season>spring|summer|fall|autumn|winter)\b"),
+        "kind": "season_offset",
+        "precision": "season",
+        "offset_years": 0,
+    },
+    {
+        "name": "next_season",
+        "pattern": re.compile(r"\bnext\s+(?P<season>spring|summer|fall|autumn|winter)\b"),
+        "kind": "season_offset",
+        "precision": "season",
+        "offset_years": 1,
     },
     {
         "name": "this_year",
@@ -174,7 +202,14 @@ TEMPORAL_PATTERN_SPECS = (
     },
     {
         "name": "last_weekend",
-        "pattern": re.compile(r"\blast weekend\b"),
+        "pattern": re.compile(r"\b(?:last|past)\s+weekend\b"),
+        "kind": "relative_label",
+        "precision": "relative",
+        "label": "weekend before",
+    },
+    {
+        "name": "this_past_weekend",
+        "pattern": re.compile(r"\bthis\s+past\s+weekend\b"),
         "kind": "relative_label",
         "precision": "relative",
         "label": "weekend before",
@@ -211,6 +246,13 @@ TEMPORAL_PATTERN_SPECS = (
         "kind": "day_offset",
         "precision": "date",
         "offset_days": 0,
+    },
+    {
+        "name": "zh_about_year_ago",
+        "pattern": re.compile(r"(约|大约|大概)?一年前"),
+        "kind": "month_offset",
+        "precision": "month",
+        "offset_months": -12,
     },
     {
         "name": "zh_last_year",
@@ -401,6 +443,16 @@ def _apply_temporal_pattern(
         payload["grounded_year"] = anchor.year + int(spec.get("offset_years") or 0)
         payload["precision"] = precision
         return payload
+    if kind == "season_offset":
+        season = str((match.group("season") if match is not None else "") or "").strip().lower()
+        if season == "fall":
+            season = "autumn"
+        if season not in {"spring", "summer", "autumn", "winter"}:
+            return payload
+        payload["grounded_season"] = season
+        payload["grounded_year"] = anchor.year + int(spec.get("offset_years") or 0)
+        payload["precision"] = precision
+        return payload
     if kind == "month_offset":
         year, month = _month_offset(anchor, int(spec.get("offset_months") or 0))
         payload["grounded_month"] = f"{year:04d}-{month:02d}"
@@ -449,6 +501,9 @@ def format_grounded_value(grounding: dict[str, Any]) -> str | None:
     if grounding.get("precision") == "relative" and grounding.get("grounded_relative"):
         value = str(grounding["grounded_relative"]).strip()
         return value[:1].upper() + value[1:] if value else None
+    if grounding.get("precision") == "season" and grounding.get("grounded_season") and grounding.get("grounded_year"):
+        season = str(grounding["grounded_season"]).strip()
+        return f"{season[:1].upper() + season[1:]} {grounding['grounded_year']}"
     if grounding.get("precision") == "year" and grounding.get("grounded_year"):
         return str(grounding["grounded_year"])
     if grounding.get("precision") == "month" and grounding.get("grounded_month"):

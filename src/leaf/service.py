@@ -5,6 +5,16 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .agentic_memory import (
+    active_topic_hints_for_text,
+    assign_atoms_to_topic_view,
+    bootstrap_seed_memory_view,
+    grow_topic_tree_from_recent_atoms,
+    route_query_to_topics,
+    stable_hash,
+    topic_tree_outline,
+    utc_now_iso,
+)
 from .clients import ChatClient, EmbeddingClient
 from .config import load_config
 from .extract import AtomExtractor, set_language_mode as set_extract_language_mode
@@ -34,6 +44,7 @@ class LEAFService:
             atom_extractor=AtomExtractor(self.memory_llm),
             embedding_client=self.embedding,
             reconciliation_llm=self.memory_llm,
+            topic_hint_provider=self._topic_hints_for_extraction,
         )
 
     def close(self) -> None:
@@ -71,6 +82,21 @@ class LEAFService:
         if resolved_mode == "migration":
             migration = self.migrate_corpus(corpus_id=corpus_id, title=title)
             result = self._merge_ingest_and_migration_results(result, migration)
+        result["agentic_memory_assignment"] = self.assign_new_atoms_to_active_memory_view(
+            corpus_id=corpus_id,
+            atom_ids=[str(atom_id) for atom_id in (result.get("written_atom_ids") or [])],
+        )
+        if resolved_mode == "migration":
+            result["agentic_memory_evolution"] = {
+                "triggered": False,
+                "reason": "migration_mode_batch_import",
+            }
+        else:
+            result["agentic_memory_evolution"] = self.maybe_evolve_agentic_memory_after_ingest(
+                corpus_id=corpus_id,
+                ingest_result=result,
+                use_config=True,
+            )
         result["ingest_mode"] = resolved_mode
         return result
 
@@ -175,11 +201,14 @@ class LEAFService:
         question: str,
         snapshot_limit: int = 6,
         raw_span_limit: int = 8,
+        *,
+        local_support_mode: str = "off",
+        trace_memory: bool = False,
     ) -> dict[str, Any]:
         if self.embedding is None:
             raise RuntimeError("Embedding model is not configured.")
         corpus_cache = self._get_search_corpus_cache(corpus_id)
-        return retrieve_leaf_memory(
+        result = retrieve_leaf_memory(
             store=self.store,
             corpus_id=corpus_id,
             question=question,
@@ -187,6 +216,370 @@ class LEAFService:
             snapshot_limit=snapshot_limit,
             raw_span_limit=raw_span_limit,
             corpus_cache=corpus_cache,
+            local_support_mode=local_support_mode,
+        )
+        active_view = self.store.get_active_memory_view(corpus_id)
+        if active_view is not None:
+            result["agentic_memory"] = {
+                "active_view_id": active_view["view_id"],
+                "view_name": active_view["name"],
+            }
+        if trace_memory:
+            self._record_search_trace(
+                corpus_id=corpus_id,
+                question=question,
+                result=result,
+                active_view=active_view,
+            )
+        return result
+
+    def bootstrap_agentic_memory_view(
+        self,
+        corpus_id: str,
+        *,
+        name: str = "seed-topic-tree-v0",
+        parent_view_id: str | None = None,
+        activate: bool = False,
+        assign_atoms: bool = True,
+        assignment_limit: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        result = bootstrap_seed_memory_view(
+            self.store,
+            corpus_id=corpus_id,
+            name=name,
+            parent_view_id=parent_view_id,
+            activate=activate,
+            assign_atoms=assign_atoms,
+            assignment_limit=assignment_limit,
+            metadata=metadata,
+        )
+        self._search_corpus_cache.pop(str(corpus_id), None)
+        return result
+
+    def ensure_seed_agentic_memory_view(
+        self,
+        corpus_id: str,
+        *,
+        name: str = "seed-topic-tree-v0",
+        activate: bool = True,
+        assign_existing_atoms: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        active_view = self.store.get_active_memory_view(corpus_id)
+        if active_view is not None:
+            return {
+                "created": False,
+                "view": active_view,
+                "assignment": {"assignments_written": 0, "reason": "active_view_exists"},
+            }
+        return {
+            "created": True,
+            "view": self.bootstrap_agentic_memory_view(
+                corpus_id=corpus_id,
+                name=name,
+                activate=activate,
+                assign_atoms=assign_existing_atoms,
+                metadata={
+                    "created_by": "LEAFService.ensure_seed_agentic_memory_view",
+                    **(metadata or {}),
+                },
+            ),
+        }
+
+    def get_active_agentic_memory_view(self, corpus_id: str) -> dict[str, Any] | None:
+        return self.store.get_active_memory_view(corpus_id)
+
+    def list_agentic_memory_views(self, corpus_id: str) -> list[dict[str, Any]]:
+        return self.store.list_memory_views(corpus_id)
+
+    def assign_new_atoms_to_active_memory_view(
+        self,
+        corpus_id: str,
+        atom_ids: list[str],
+    ) -> dict[str, Any]:
+        active_view = self.store.get_active_memory_view(corpus_id)
+        normalized_atom_ids = list(dict.fromkeys(str(atom_id).strip() for atom_id in atom_ids if str(atom_id).strip()))
+        if active_view is None:
+            return {
+                "assigned": False,
+                "reason": "no_active_view",
+                "atom_count": len(normalized_atom_ids),
+                "assignments_written": 0,
+            }
+        if not normalized_atom_ids:
+            return {
+                "assigned": False,
+                "reason": "no_new_atoms",
+                "active_view_id": active_view["view_id"],
+                "atom_count": 0,
+                "assignments_written": 0,
+            }
+        assignment = assign_atoms_to_topic_view(
+            self.store,
+            corpus_id=corpus_id,
+            view_id=str(active_view["view_id"]),
+            atom_ids=normalized_atom_ids,
+            commit=True,
+        )
+        self._search_corpus_cache.pop(str(corpus_id), None)
+        return {
+            "assigned": True,
+            "active_view_id": active_view["view_id"],
+            **assignment,
+        }
+
+    def backfill_active_memory_view_assignments(
+        self,
+        corpus_id: str,
+        *,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        active_view = self.store.get_active_memory_view(corpus_id)
+        if active_view is None:
+            return {
+                "assigned": False,
+                "reason": "no_active_view",
+                "assignments_written": 0,
+            }
+        assignment = assign_atoms_to_topic_view(
+            self.store,
+            corpus_id=corpus_id,
+            view_id=str(active_view["view_id"]),
+            limit=limit,
+            commit=True,
+        )
+        self._search_corpus_cache.pop(str(corpus_id), None)
+        return {
+            "assigned": True,
+            "active_view_id": active_view["view_id"],
+            **assignment,
+        }
+
+    def route_query_topics(self, corpus_id: str, question: str, *, top_k: int = 3) -> dict[str, Any] | None:
+        active_view = self.store.get_active_memory_view(corpus_id)
+        if active_view is None:
+            return None
+        routes = route_query_to_topics(
+            self.store,
+            view_id=str(active_view["view_id"]),
+            query=question,
+            top_k=top_k,
+        )
+        return {
+            "active_view_id": active_view["view_id"],
+            "view_name": active_view["name"],
+            "router": "keyword_shadow_v0",
+            "top_k": top_k,
+            "routes": routes,
+        }
+
+    def get_agentic_topic_tree(self, corpus_id: str, *, view_id: str | None = None) -> dict[str, Any] | None:
+        view = self.store.get_memory_view(view_id) if view_id else self.store.get_active_memory_view(corpus_id)
+        if view is None:
+            return None
+        return {
+            "view": view,
+            "tree": topic_tree_outline(self.store, view_id=str(view["view_id"])),
+        }
+
+    def maybe_evolve_agentic_memory_after_ingest(
+        self,
+        *,
+        corpus_id: str,
+        ingest_result: dict[str, Any],
+        force: bool = False,
+        turns_threshold: int = 50,
+        atoms_threshold: int = 40,
+        min_cluster_atoms: int = 3,
+        max_new_topics: int = 3,
+        max_depth: int = 4,
+        window_atom_limit: int = 80,
+        trigger_policy: str = "any",
+        growth_strategy: str = "global_terms",
+        evolved_primary_assignment_enabled: bool = True,
+        evolved_primary_assignment_mode: str = "all",
+        use_config: bool = False,
+    ) -> dict[str, Any]:
+        ingest_cfg = self.config.ingest
+        if not force and ingest_cfg is not None and not bool(ingest_cfg.online_evolution_enabled):
+            return {"triggered": False, "reason": "online_evolution_disabled"}
+        if use_config and ingest_cfg is not None:
+            turns_threshold = int(ingest_cfg.online_evolution_turns_threshold)
+            atoms_threshold = int(ingest_cfg.online_evolution_atoms_threshold)
+            min_cluster_atoms = int(ingest_cfg.online_evolution_min_cluster_atoms)
+            max_new_topics = int(ingest_cfg.online_evolution_max_new_topics)
+            max_depth = int(ingest_cfg.online_evolution_max_depth)
+            window_atom_limit = int(ingest_cfg.online_evolution_window_atom_limit)
+            trigger_policy = str(ingest_cfg.online_evolution_trigger_policy)
+            growth_strategy = str(ingest_cfg.online_evolution_growth_strategy)
+            evolved_primary_assignment_enabled = bool(
+                ingest_cfg.online_evolution_evolved_primary_assignment_enabled
+            )
+            evolved_primary_assignment_mode = str(
+                ingest_cfg.online_evolution_evolved_primary_assignment_mode
+            )
+        evolved_primary_assignment_mode = str(evolved_primary_assignment_mode or "all").strip().lower()
+        if not evolved_primary_assignment_enabled and evolved_primary_assignment_mode == "all":
+            evolved_primary_assignment_mode = "none"
+        secondary_kwargs: dict[str, Any] = {}
+        if use_config and ingest_cfg is not None:
+            secondary_kwargs = {
+                "secondary_assignment_enabled": bool(ingest_cfg.online_evolution_secondary_assignment_enabled),
+                "secondary_max_assignments": int(ingest_cfg.online_evolution_secondary_max_assignments),
+                "secondary_min_score": float(ingest_cfg.online_evolution_secondary_min_score),
+                "secondary_min_term_overlap": int(ingest_cfg.online_evolution_secondary_min_term_overlap),
+                "secondary_min_embedding_score": float(ingest_cfg.online_evolution_secondary_min_embedding_score),
+                "secondary_text_mode": str(ingest_cfg.online_evolution_secondary_text_mode),
+                "secondary_max_profile_terms": int(ingest_cfg.online_evolution_secondary_max_profile_terms),
+                "secondary_min_score_margin": float(ingest_cfg.online_evolution_secondary_min_score_margin),
+                "secondary_min_score_ratio": float(ingest_cfg.online_evolution_secondary_min_score_ratio),
+            }
+        active_view = self.store.get_active_memory_view(corpus_id)
+        if active_view is None:
+            return {"triggered": False, "reason": "no_active_view"}
+        written_atom_ids = [str(atom_id) for atom_id in (ingest_result.get("written_atom_ids") or []) if str(atom_id)]
+        turn_count = int(ingest_result.get("events_written") or ingest_result.get("turn_count") or 0)
+        atom_count = len(written_atom_ids)
+        view_metadata = dict(active_view.get("metadata") or {})
+        pending = dict(view_metadata.get("online_evolution_pending") or {})
+        pending_turns = int(pending.get("turns") or 0) + turn_count
+        pending_atoms = int(pending.get("atoms") or 0) + atom_count
+        pending_atom_ids = [str(atom_id) for atom_id in (pending.get("atom_ids") or []) if str(atom_id)]
+        pending_atom_ids.extend(written_atom_ids)
+        pending_atom_ids = list(dict.fromkeys(pending_atom_ids))[-max(1, int(window_atom_limit)) :]
+
+        policy = str(trigger_policy or "any").strip().lower()
+        if policy == "all":
+            threshold_met = pending_turns >= int(turns_threshold) and pending_atoms >= int(atoms_threshold)
+        elif policy == "turns":
+            threshold_met = pending_turns >= int(turns_threshold)
+        else:
+            threshold_met = pending_turns >= int(turns_threshold) or pending_atoms >= int(atoms_threshold)
+        should_trigger = force or threshold_met
+        if not should_trigger:
+            view_metadata["online_evolution_pending"] = {
+                "turns": pending_turns,
+                "atoms": pending_atoms,
+                "atom_ids": pending_atom_ids,
+                "updated_at": utc_now_iso(),
+            }
+            self.store.update_memory_view_metadata(str(active_view["view_id"]), metadata=view_metadata)
+            self.store.commit()
+            return {
+                "triggered": False,
+                "reason": "below_threshold",
+                "active_view_id": active_view["view_id"],
+                "pending_turns": pending_turns,
+                "pending_atoms": pending_atoms,
+                "turns_threshold": turns_threshold,
+                "atoms_threshold": atoms_threshold,
+                "trigger_policy": policy,
+            }
+
+        run_created_at = utc_now_iso()
+        run_id = f"evo_{stable_hash(corpus_id, str(active_view['view_id']), run_created_at, length=24)}"
+        trigger = {
+            "mode": "online_per_n_conversation",
+            "force": bool(force),
+            "pending_turns": pending_turns,
+            "pending_atoms": pending_atoms,
+            "recent_atom_count": len(pending_atom_ids),
+            "turns_threshold": turns_threshold,
+            "atoms_threshold": atoms_threshold,
+            "trigger_policy": policy,
+            "min_cluster_atoms": min_cluster_atoms,
+            "max_new_topics": max_new_topics,
+            "max_depth": max_depth,
+            "growth_strategy": growth_strategy,
+            "evolved_primary_assignment_enabled": bool(evolved_primary_assignment_enabled),
+            "evolved_primary_assignment_mode": evolved_primary_assignment_mode,
+        }
+        self.store.add_evolution_run(
+            run_id=run_id,
+            corpus_id=corpus_id,
+            base_view_id=str(active_view["view_id"]),
+            status="running",
+            trigger=trigger,
+            result={},
+            created_at=run_created_at,
+        )
+        self.store.commit()
+        try:
+            growth = grow_topic_tree_from_recent_atoms(
+                self.store,
+                corpus_id=corpus_id,
+                base_view=active_view,
+                recent_atom_ids=pending_atom_ids,
+                name=f"online-topic-growth-{run_created_at}",
+                max_new_topics=max_new_topics,
+                min_cluster_atoms=min_cluster_atoms,
+                window_atom_limit=window_atom_limit,
+                max_depth=max_depth,
+                growth_strategy=growth_strategy,
+                evolved_primary_assignment_enabled=bool(evolved_primary_assignment_enabled),
+                evolved_primary_assignment_mode=evolved_primary_assignment_mode,
+                activate=True,
+                trigger=trigger,
+                **secondary_kwargs,
+            )
+            completed_at = utc_now_iso()
+            status = "promoted" if growth.get("status") == "promoted" else "skipped"
+            self.store.add_evolution_run(
+                run_id=run_id,
+                corpus_id=corpus_id,
+                base_view_id=str(active_view["view_id"]),
+                candidate_view_id=str(growth.get("view_id") or "") or None,
+                status=status,
+                trigger=trigger,
+                result=growth,
+                created_at=run_created_at,
+                completed_at=completed_at,
+            )
+            if growth.get("status") == "promoted":
+                new_view = self.store.get_active_memory_view(corpus_id)
+                if new_view is not None:
+                    metadata = dict(new_view.get("metadata") or {})
+                    metadata["online_evolution_pending"] = {
+                        "turns": 0,
+                        "atoms": 0,
+                        "atom_ids": [],
+                        "updated_at": completed_at,
+                    }
+                    self.store.update_memory_view_metadata(str(new_view["view_id"]), metadata=metadata)
+            else:
+                view_metadata["online_evolution_pending"] = {
+                    "turns": 0,
+                    "atoms": 0,
+                    "atom_ids": [],
+                    "updated_at": completed_at,
+                    "last_skipped_reason": growth.get("status"),
+                }
+                self.store.update_memory_view_metadata(str(active_view["view_id"]), metadata=view_metadata)
+            self.store.commit()
+            self._search_corpus_cache.pop(str(corpus_id), None)
+            return {"triggered": True, "run_id": run_id, **growth}
+        except Exception as exc:
+            completed_at = utc_now_iso()
+            self.store.add_evolution_run(
+                run_id=run_id,
+                corpus_id=corpus_id,
+                base_view_id=str(active_view["view_id"]),
+                status="failed",
+                trigger=trigger,
+                result={"error": str(exc)},
+                created_at=run_created_at,
+                completed_at=completed_at,
+            )
+            self.store.commit()
+            raise
+
+    def _topic_hints_for_extraction(self, corpus_id: str, text: str) -> dict[str, Any] | None:
+        return active_topic_hints_for_text(
+            self.store,
+            corpus_id=corpus_id,
+            text=text,
+            limit=5,
         )
 
     def get_root_snapshot(self, corpus_id: str) -> dict[str, Any] | None:
@@ -254,6 +647,45 @@ class LEAFService:
 
     def list_corpora(self) -> list[str]:
         return self.store.list_corpora()
+
+    def _record_search_trace(
+        self,
+        *,
+        corpus_id: str,
+        question: str,
+        result: dict[str, Any],
+        active_view: dict[str, Any] | None,
+    ) -> None:
+        created_at = utc_now_iso()
+        view_id = str(active_view["view_id"]) if active_view is not None else None
+        retrieved_ids: list[str] = []
+        for page in result.get("pages") or []:
+            page_id = str(page.get("page_id") or page.get("snapshot_id") or "").strip()
+            if page_id:
+                retrieved_ids.append(f"page:{page_id}")
+        for raw_span in result.get("raw_spans") or []:
+            span_id = str(raw_span.get("event_id") or raw_span.get("span_id") or "").strip()
+            if span_id:
+                retrieved_ids.append(f"event:{span_id}")
+        trace_id = f"trace_{stable_hash(corpus_id, view_id or '', question, created_at, length=24)}"
+        self.store.add_search_trace(
+            trace_id=trace_id,
+            corpus_id=corpus_id,
+            view_id=view_id,
+            question=question,
+            query_schema={
+                "snapshot_limit": result.get("snapshot_limit"),
+                "raw_span_limit": result.get("raw_span_limit"),
+            },
+            retrieved_ids=retrieved_ids,
+            metrics={
+                "search_elapsed_ms": (result.get("timing") or {}).get("search_elapsed_ms"),
+                "page_count": len(result.get("pages") or []),
+                "raw_span_count": len(result.get("raw_spans") or []),
+            },
+            created_at=created_at,
+        )
+        self.store.commit()
 
     def _get_search_corpus_cache(self, corpus_id: str) -> dict[str, Any]:
         key = str(corpus_id)
