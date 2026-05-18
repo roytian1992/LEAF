@@ -5043,3 +5043,218 @@ Caveats:
 - `llm_fact_v2` rows for conv-30 and conv-43 include smoke/retry leftovers; future clean runs should either use a fresh DB or add window-level source/run cleanup to avoid semantically near-duplicate facts.
 - A temporal runtime-skip ablation was started and stopped early because conv43 degraded sharply in the first 107 questions; partial output is `reports/agentic_memory/locomo4_mem0v2_temporalskip_llmfact_hybrid_sharedsupport_evolved_profileauto_fullsubset_20260518.json` and should not be used as a final result.
 - Directly adding `llm_fact_v1` sidecar facts into the answer context on conv-30 underperformed the hybrid-only path: `reports/agentic_memory/locomo4_mem0style_llmfact_directsupport2_sharedsupport_evolved_profileauto_conv30_20260518.json` gave F1 `0.5712`, BLEU1 `0.5135`, versus the prior conv-30 hybrid/shared support result F1 `0.5819`, BLEU1 `0.5271`.
+
+LLM-as-judge supplement:
+
+- Judge model: local OpenAI-compatible `Qwen3-235B`
+- Judge URL/config: `tmp/config_agentic_qwen8002_judge.yaml`
+- Judge style: LoCoMo `legacy_binary`
+- Judge runs: `1`
+- Final requested worker count: `32`
+- Output: `reports/agentic_memory/judge_20260518/locomo4_mem0v2_gpt54mini_qwen8002_judge1_legacybinary_w32_20260518.json`
+- Progress: `reports/agentic_memory/judge_20260518/locomo4_mem0v2_gpt54mini_qwen8002_judge1_legacybinary_w32_20260518.judge_progress.jsonl`
+- Log: `logs/judge_locomo_mem0v2_qwen8002_w32_20260518.log`
+- Completed: `true`
+- Judge count: `567`
+- Judge-1: `0.7549`
+
+Judge-1 by category:
+
+| Category | Q | Judge-1 | F1 | BLEU1 |
+| --- | ---: | ---: | ---: | ---: |
+| multi_hop | 94 | 0.6702 | 0.4043 | 0.3146 |
+| open_domain | 34 | 0.5588 | 0.2712 | 0.2392 |
+| single_hop | 321 | 0.8287 | 0.6169 | 0.5648 |
+| temporal | 118 | 0.6780 | 0.6319 | 0.5903 |
+
+## 2026-05-18 Full LoCoMo Mem0-Inspired Completion
+
+Purpose:
+
+- Complete the remaining LoCoMo conversations for the mem0-inspired `llm_fact_v2` hybrid run.
+- Compute full 10-conversation QA metrics and one-pass LoCoMo `legacy_binary` LLM-as-judge.
+- Keep the public comparison focused on GPT-5.4-mini memory construction + Qwen answer/judge variants.
+
+Inputs and configs:
+
+- Full LoCoMo input: `/vepfs-mlp2/c20250513/241404044/users/roytian/LEAF_dev/benchmarks/locomo/locomo10_noadv.json`
+- Full input count: 10 conversations, 1540 QA.
+- Memory/answer config: `tmp/config_agentic_codeai_memory_qwen_answer.yaml`
+  - Answer LLM: local OpenAI-compatible `Qwen3-235B`, `http://localhost:8001/v1`
+  - Memory LLM: `gpt-5.4-mini`, `https://codeai.ysaikeji.cn/v1`
+- Judge config: `tmp/config_agentic_qwen8002_judge.yaml`
+  - Judge LLM: local OpenAI-compatible `Qwen3-235B`, `http://localhost:8002/v1`
+- DB: `data/agentic_smoke/locomo10_evolvedtopic_secondary_profileauto_llmfacts_20260518.sqlite3`
+- Conda wrapper: `./scripts/with_tracenav_nlp.sh python`
+
+Rest-6 sidecar build:
+
+- Output: `reports/agentic_memory/locomo_rest6_llmfact_v2_sidecar_build_20260518.json`
+- Log: `logs/locomo_rest6_llmfact_v2_sidecar_build_20260518.log`
+- Command:
+
+```bash
+./scripts/with_tracenav_nlp.sh python scripts/build_additive_memory_sidecar.py \
+  --config tmp/config_agentic_codeai_memory_qwen_answer.yaml \
+  --db data/agentic_smoke/locomo10_evolvedtopic_secondary_profileauto_llmfacts_20260518.sqlite3 \
+  --corpus-id locomo_conv_26 --corpus-id locomo_conv_41 --corpus-id locomo_conv_42 \
+  --corpus-id locomo_conv_44 --corpus-id locomo_conv_48 --corpus-id locomo_conv_49 \
+  --mode llm_facts \
+  --llm-source llm_fact_v2 \
+  --llm-extraction-policy mem0_additive_v2 \
+  --llm-window-size 8 \
+  --llm-max-facts-per-window 8 \
+  --llm-workers 6 \
+  --llm-timeout 90 \
+  --max-atoms-per-event 4 \
+  --flush-every-windows 10 \
+  --output reports/agentic_memory/locomo_rest6_llmfact_v2_sidecar_build_20260518.json
+```
+
+Rest-6 sidecar counts:
+
+| Corpus | Events | Base atoms | `llm_fact_v2` facts | Windows | Errors |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| conv-26 | 419 | 560 | 417 | 61 | 0 |
+| conv-41 | 663 | 910 | 651 | 98 | 0 |
+| conv-42 | 629 | 842 | 626 | 90 | 0 |
+| conv-44 | 675 | 902 | 647 | 95 | 0 |
+| conv-48 | 681 | 902 | 666 | 93 | 2 |
+| conv-49 | 509 | 673 | 515 | 75 | 0 |
+
+QA execution:
+
+- Initial rest-6 sequential run was interrupted after completing conv-26 and partially starting conv-41.
+- Completed conv-41, conv-42, conv-44, conv-48, and conv-49 with independent one-corpus tmux jobs using the same retrieval and answer flags as the 4-corpus mem0-inspired run above.
+- Split inputs:
+  - `tmp/locomo_mem0v2_split_20260518/conv-41_noadv.json`
+  - `tmp/locomo_mem0v2_split_20260518/conv-42_noadv.json`
+  - `tmp/locomo_mem0v2_split_20260518/conv-44_noadv.json`
+  - `tmp/locomo_mem0v2_split_20260518/conv-48_noadv.json`
+  - `tmp/locomo_mem0v2_split_20260518/conv-49_noadv.json`
+- Per-corpus QA reports:
+  - `reports/agentic_memory/locomo_conv_41_mem0v2_llmfact_hybrid_sharedsupport_evolved_profileauto_20260518.json`
+  - `reports/agentic_memory/locomo_conv_42_mem0v2_llmfact_hybrid_sharedsupport_evolved_profileauto_20260518.json`
+  - `reports/agentic_memory/locomo_conv_44_mem0v2_llmfact_hybrid_sharedsupport_evolved_profileauto_20260518.json`
+  - `reports/agentic_memory/locomo_conv_48_mem0v2_llmfact_hybrid_sharedsupport_evolved_profileauto_20260518.json`
+  - `reports/agentic_memory/locomo_conv_49_mem0v2_llmfact_hybrid_sharedsupport_evolved_profileauto_20260518.json`
+- Per-corpus logs:
+  - `logs/locomo_conv_41_mem0v2_llmfact_hybrid_sharedsupport_qa_20260518.log`
+  - `logs/locomo_conv_42_mem0v2_llmfact_hybrid_sharedsupport_qa_20260518.log`
+  - `logs/locomo_conv_44_mem0v2_llmfact_hybrid_sharedsupport_qa_20260518.log`
+  - `logs/locomo_conv_48_mem0v2_llmfact_hybrid_sharedsupport_qa_20260518.log`
+  - `logs/locomo_conv_49_mem0v2_llmfact_hybrid_sharedsupport_qa_20260518.log`
+- Combined full QA report: `reports/agentic_memory/locomo10_mem0v2_llmfact_hybrid_sharedsupport_evolved_profileauto_full_20260518.json`
+
+Combination details:
+
+- Combined sources:
+  - 4-corpus completed report: `reports/agentic_memory/locomo4_mem0v2_llmfact_hybrid_sharedsupport_evolved_profileauto_fullsubset_20260518.json`
+  - conv-26 rows only from interrupted rest-6 report: `reports/agentic_memory/locomo_rest6_mem0v2_llmfact_hybrid_sharedsupport_evolved_profileauto_20260518.json`
+  - conv-41/42/44/48/49 independent completed reports listed above.
+- Caveat: the interrupted rest-6 report summary contains conv-26 plus partial conv-41, so the combined full report filtered that source to `sample_id == conv-26`.
+
+Full QA result:
+
+- Completed: `true`
+- Evaluated questions: `1540`
+- Overall: F1 `0.5564`, BLEU1 `0.4995`
+- Average search latency: `335.37 ms`
+- Average answer latency: `1761.26 ms`
+
+Full QA per category:
+
+| Category | Q | F1 | BLEU1 |
+| --- | ---: | ---: | ---: |
+| multi_hop | 282 | 0.3618 | 0.2802 |
+| open_domain | 96 | 0.3015 | 0.2431 |
+| single_hop | 841 | 0.6200 | 0.5660 |
+| temporal | 321 | 0.6370 | 0.5946 |
+
+Full QA per corpus:
+
+| Corpus | Q | F1 | BLEU1 |
+| --- | ---: | ---: | ---: |
+| conv-26 | 152 | 0.5960 | 0.5356 |
+| conv-30 | 81 | 0.5886 | 0.5311 |
+| conv-41 | 152 | 0.6241 | 0.5606 |
+| conv-42 | 199 | 0.5111 | 0.4575 |
+| conv-43 | 178 | 0.6059 | 0.5473 |
+| conv-44 | 123 | 0.5320 | 0.4828 |
+| conv-47 | 150 | 0.5487 | 0.4990 |
+| conv-48 | 191 | 0.5646 | 0.5066 |
+| conv-49 | 156 | 0.4908 | 0.4279 |
+| conv-50 | 158 | 0.5189 | 0.4643 |
+
+LLM-as-judge:
+
+- Judge style: LoCoMo `legacy_binary`
+- Judge runs: `1`
+- Requested final worker count: `8`
+- Output: `reports/agentic_memory/judge_20260518/locomo10_mem0v2_gpt54mini_qwen8002_judge1_legacybinary_w8_20260518.json`
+- Progress: `reports/agentic_memory/judge_20260518/locomo10_mem0v2_gpt54mini_qwen8002_judge1_legacybinary_w8_20260518.judge_progress.jsonl`
+- Log: `logs/judge_locomo10_mem0v2_qwen8002_w8_20260518.log`
+- Command:
+
+```bash
+./scripts/with_tracenav_nlp.sh python scripts/judge_locomo_report.py \
+  --config tmp/config_agentic_qwen8002_judge.yaml \
+  --input-report reports/agentic_memory/locomo10_mem0v2_llmfact_hybrid_sharedsupport_evolved_profileauto_full_20260518.json \
+  --output-report reports/agentic_memory/judge_20260518/locomo10_mem0v2_gpt54mini_qwen8002_judge1_legacybinary_w8_20260518.json \
+  --judge-style legacy_binary \
+  --judge-runs 1 \
+  --judge-retries 3 \
+  --judge-max-workers 8 \
+  --resume-progress
+```
+
+Judge result:
+
+- Completed: `true`
+- Judge count: `1540`
+- Judge-1: `0.7597`
+
+Judge-1 by category:
+
+| Category | Q | Judge-1 | F1 | BLEU1 |
+| --- | ---: | ---: | ---: | ---: |
+| multi_hop | 282 | 0.6560 | 0.3618 | 0.2802 |
+| open_domain | 96 | 0.5938 | 0.3015 | 0.2431 |
+| single_hop | 841 | 0.8347 | 0.6200 | 0.5660 |
+| temporal | 321 | 0.7040 | 0.6370 | 0.5946 |
+
+Judge-1 by corpus:
+
+| Corpus | Q | Judge-1 | F1 | BLEU1 |
+| --- | ---: | ---: | ---: | ---: |
+| conv-26 | 152 | 0.7632 | 0.5960 | 0.5356 |
+| conv-30 | 81 | 0.7901 | 0.5886 | 0.5311 |
+| conv-41 | 152 | 0.8355 | 0.6241 | 0.5606 |
+| conv-42 | 199 | 0.7487 | 0.5111 | 0.4575 |
+| conv-43 | 178 | 0.7753 | 0.6059 | 0.5473 |
+| conv-44 | 123 | 0.7154 | 0.5320 | 0.4828 |
+| conv-47 | 150 | 0.6800 | 0.5487 | 0.4990 |
+| conv-48 | 191 | 0.7644 | 0.5646 | 0.5066 |
+| conv-49 | 156 | 0.7500 | 0.4908 | 0.4279 |
+| conv-50 | 158 | 0.7785 | 0.5189 | 0.4643 |
+
+Full LoCoMo comparison:
+
+| Run | Q | F1 | BLEU1 | Judge-1 |
+| --- | ---: | ---: | ---: | ---: |
+| LEAF-Base | 1540 | 0.5593 | 0.5022 | 0.7714 |
+| EvolvedTopic anchor | 1540 | 0.5596 | 0.5022 | 0.7727 |
+| Mem0-inspired `llm_fact_v2` hybrid | 1540 | 0.5564 | 0.4995 | 0.7597 |
+
+Comparison sources:
+
+- LEAF-Base QA: `reports/agentic_memory/locomo10_leafbase_evalv16_textonly_notype_adaptive_rawspan_precise_qwen_answer_full_20260516.json`
+- LEAF-Base judge: `reports/agentic_memory/judge_20260518/locomo10_base_gpt54mini_qwen8002_judge1_legacybinary_20260518.json`
+- EvolvedTopic QA: `reports/agentic_memory/locomo10_evolvedtopic_secondary_profileauto_topicsoft_textpolicy_full_20260516.json`
+- EvolvedTopic judge: `reports/agentic_memory/judge_20260518/locomo10_evolved_gpt54mini_qwen8002_judge1_legacybinary_20260518.json`
+
+Caveats:
+
+- The full mem0-inspired run does not beat the current full LoCoMo anchors. It improved the earlier 4-corpus challenge subset but lost that gain on the other six conversations.
+- The official judge output used 8 workers, but its progress file was seeded with 218 already-completed rows from an interrupted 32-worker judge attempt, then resumed with 8 workers for the remaining rows. The judge model/config/style are identical, so scores should be deterministic; rerun from an empty progress file if strict worker-count purity is required.
+- Search stayed non-LLM at QA time. The QA jobs reused the DB and sidecar facts; `gpt-5.4-mini` was not in the answer/search hot path.
